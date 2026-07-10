@@ -15920,7 +15920,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # No error
         f(x)
 
-    @requires_gpu()
+    @requires_accelerator()
     @torch._inductor.config.patch("layout_optimization", True)
     @torch._inductor.config.patch("keep_output_stride", False)
     @config.patch(implicit_fallbacks=True)
@@ -16147,7 +16147,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             compiled_inductor_out = compiled_inductor_f(x)
             self.assertEqual(compiled_inductor_out, eager_out)
 
-    @requires_gpu()
+    @requires_accelerator()
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fixed_layout_channels_last(self):
         class Block(nn.Module):
@@ -16170,9 +16170,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 out = torch.ops.test.baz(out)
                 return out
 
+        target_device = _get_accelerator_device_type(self.device)
         model = Block()
-        model = model.to(GPU_TYPE).to(memory_format=torch.channels_last)
-        input_t = torch.randn([1, 320, 128, 128], dtype=torch.float32, device=GPU_TYPE)
+        model = model.to(target_device).to(memory_format=torch.channels_last)
+        input_t = torch.randn(
+            [1, 320, 128, 128], dtype=torch.float32, device=target_device
+        )
         input_t = input_t.to(memory_format=torch.channels_last)
         expected_strides = model.helper(input_t).stride()
 
