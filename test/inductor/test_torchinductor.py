@@ -152,6 +152,7 @@ from torch.testing._internal.inductor_utils import (  # noqa: F401
     HAS_CPU,
     HAS_GPU,
     HAS_MPS,
+    HAS_MULTIGPU,
     HAS_TPU,
     IS_BIG_GPU,
     requires_gpu,
@@ -178,56 +179,9 @@ if TEST_WITH_ROCM:
     os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] = "1"
 
 aten = torch.ops.aten
-
-
-def _current_accelerator_device_type() -> str | None:
-    accelerator = torch.accelerator.current_accelerator(check_available=True)
-    return accelerator.type if accelerator is not None else None
-
-
-def _has_multiple_accelerator_devices() -> bool:
-    device_type = _current_accelerator_device_type()
-    return (
-        device_type is not None
-        and torch.get_device_module(device_type).device_count() >= 2
-    )
-
-
-def _current_accelerator_dispatch_key() -> str | None:
-    device_type = _current_accelerator_device_type()
-    if device_type is None:
-        return None
-    return torch._C._dispatch_key_for_device(device_type)
-
-
-def _is_privateuse1_device(device: str) -> bool:
-    try:
-        device_type = torch.device(device).type
-        return torch._C._dispatch_key_for_device(device_type) == "PrivateUse1"
-    except RuntimeError:
-        return False
-
-
-def _impl_current_accelerator_op(id_: str, fn) -> None:
-    dispatch_key = _current_accelerator_dispatch_key()
-    if dispatch_key is not None and dispatch_key not in {
-        "CPU",
-        "CUDA",
-        "XPU",
-        "MPS",
-    }:
-        libtest.impl(id_, fn, dispatch_key)
-
-
+_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
 requires_multigpu = functools.partial(
-    unittest.skipIf,
-    not _has_multiple_accelerator_devices(),
-    f"requires multiple {_current_accelerator_device_type() or 'accelerator'} devices",
-)
-requires_accelerator = functools.partial(
-    unittest.skipIf,
-    _current_accelerator_device_type() is None,
-    "requires accelerator",
+    unittest.skipIf, not HAS_MULTIGPU, f"requires multiple {GPU_TYPE} devices"
 )
 requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "requires cuda")
 skip_if_x86_mac = functools.partial(
@@ -312,7 +266,7 @@ def define_custom_op_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        _impl_current_accelerator_op(id_, fn)
+        libtest.impl(id_, fn, "PrivateUse1")
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -328,7 +282,7 @@ def define_custom_op_2_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        _impl_current_accelerator_op(id_, fn)
+        libtest.impl(id_, fn, "PrivateUse1")
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -342,7 +296,7 @@ def define_custom_op_3_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        _impl_current_accelerator_op(id_, fn)
+        libtest.impl(id_, fn, "PrivateUse1")
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -871,14 +825,12 @@ def check_model_gpu(
     exact_stride=False,
 ):
     kwargs = kwargs or {}
-    target_device = _get_accelerator_device_type(getattr(self, "device", "cpu"))
     if hasattr(model, "to"):
-        model = model.to(device=target_device)
+        model = model.to(device=GPU_TYPE)
 
     if copy_to_gpu:
         example_inputs = tuple(
-            clone_preserve_strides_offset(x, device=target_device)
-            for x in example_inputs
+            clone_preserve_strides_offset(x, device=GPU_TYPE) for x in example_inputs
         )
 
     check_model(
@@ -906,7 +858,7 @@ def check_model_gpu(
             if not isinstance(x, torch.Tensor) or x.dtype != torch.float:
                 return x
             return torch.empty_strided(
-                x.size(), x.stride(), device=target_device, dtype=torch.half
+                x.size(), x.stride(), device=GPU_TYPE, dtype=torch.half
             ).copy_(x)
 
         example_inputs = list(map(downcast_fn, example_inputs))
@@ -1761,12 +1713,7 @@ class CommonTemplate:
             "torch.ops.aten.add.Tensor",
         ]
         if config.cpp_wrapper:
-            fallback_markers.extend(
-                [
-                    "aoti_torch_cuda_add_Tensor",
-                    "aoti_torch_cpu_add_Tensor",
-                ]
-            )
+            fallback_markers.append(f"aoti_torch_{self.device}_add_Tensor")
         self.assertTrue(
             any(code.count(marker) >= 1 for marker in fallback_markers),
             msg=f"Expected complex add with strided inputs to fall back to extern kernels, got:\n{code}",
@@ -2622,14 +2569,8 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op(self):
-        if (
-            self.device != "cuda"
-            and self.device != "xpu"
-            and not _is_privateuse1_device(self.device)
-        ):
-            raise unittest.SkipTest(
-                "associative_scan only supported on CUDA, XPU, or PrivateUse1"
-            )
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def sum_combine(a, b):
             return a + b
@@ -2657,14 +2598,8 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_compiled(self):
-        if (
-            self.device != "cuda"
-            and self.device != "xpu"
-            and not _is_privateuse1_device(self.device)
-        ):
-            raise unittest.SkipTest(
-                "associative_scan only supported on CUDA, XPU, or PrivateUse1"
-            )
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         from torch._higher_order_ops.associative_scan import associative_scan
 
@@ -2698,14 +2633,8 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_multi_input(self):
-        if (
-            self.device != "cuda"
-            and self.device != "xpu"
-            and not _is_privateuse1_device(self.device)
-        ):
-            raise unittest.SkipTest(
-                "associative_scan only supported on CUDA, XPU, or PrivateUse1"
-            )
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def argmax_combine(a, b):
             a_value, a_index = a
@@ -2731,14 +2660,8 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_would_split(self):
-        if (
-            self.device != "cuda"
-            and self.device != "xpu"
-            and not _is_privateuse1_device(self.device)
-        ):
-            raise unittest.SkipTest(
-                "associative_scan only supported on CUDA, XPU, or PrivateUse1"
-            )
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def combine_linear_recurrence(left, right):
             xl, fl = left
@@ -3216,8 +3139,8 @@ class CommonTemplate:
 
     @skip_if_gpu_halide
     def test_cumprod_backward_split_scan_reduction_fusion(self):
-        if self.device not in ("cuda", "xpu"):
-            raise unittest.SkipTest("split scan only supported on GPU")
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            raise unittest.SkipTest("split scan requires a supported accelerator")
 
         seq_len = 8193
         channels = 64
@@ -3530,10 +3453,8 @@ class CommonTemplate:
 
     @requires_multigpu()
     def test_linspace4(self):
-        target_device = _get_accelerator_device_type(self.device)
-
         def fn(x):
-            return torch.linspace(0, 2, 0, device=f"{target_device}:1")
+            return torch.linspace(0, 2, 0, device=f"{GPU_TYPE}:1")
 
         self.common(fn, (torch.Tensor([]),))
 
@@ -3806,8 +3727,8 @@ class CommonTemplate:
         with torch.no_grad():
             self.assertEqual(cfn(x, i), fn(x, i))
 
-    @skipCPUIf(True, "requires CUDA/Triton")
-    @requires_cuda_and_triton
+    @skipCPUIf(True, "requires accelerator/Triton")
+    @requires_gpu_and_triton
     def test_builtins_round_float_ndigits_neg_uses_value_expr(self):
         def fn(x, i):
             return x + round(i / 2 * 123.4567, -1)
@@ -4771,7 +4692,9 @@ for dtype in (torch.int32, torch.int64):
 
         fn = torch.vmap(dot_based)
         bmm_codegen_call = (
-            "aoti_torch_cuda_bmm_out" if config.cpp_wrapper else "extern_kernels.bmm"
+            f"aoti_torch_{self.device}_bmm_out"
+            if config.cpp_wrapper
+            else "extern_kernels.bmm"
         )
         bmm_fallback_call = (
             'aoti_torch_call_dispatcher("aten::bmm"'
@@ -4808,7 +4731,9 @@ for dtype in (torch.int32, torch.int64):
             return torch.bmm(a, b)
 
         bmm_codegen_call = (
-            "aoti_torch_cuda_bmm_out" if config.cpp_wrapper else "extern_kernels.bmm"
+            f"aoti_torch_{self.device}_bmm_out"
+            if config.cpp_wrapper
+            else "extern_kernels.bmm"
         )
         bmm_fallback_call = (
             'aoti_torch_call_dispatcher("aten::bmm"'
@@ -4841,7 +4766,9 @@ for dtype in (torch.int32, torch.int64):
             return torch.bmm(a, b)
 
         bmm_codegen_call = (
-            "aoti_torch_cuda_bmm_out" if config.cpp_wrapper else "extern_kernels.bmm"
+            f"aoti_torch_{self.device}_bmm_out"
+            if config.cpp_wrapper
+            else "extern_kernels.bmm"
         )
         bmm_fallback_call = (
             'aoti_torch_call_dispatcher("aten::bmm"'
@@ -5720,13 +5647,13 @@ for dtype in (torch.int32, torch.int64):
             ),
         )
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_to_device(self):
-        target_device = torch.device(_get_accelerator_device_type(self.device))
-
         def fn(a):
             if a.device.type == "cpu":
-                return aten._to_copy(a, device=target_device, dtype=6, layout=0)
+                return aten._to_copy(
+                    a, device=torch.device(GPU_TYPE), dtype=6, layout=0
+                )
             else:
                 return aten._to_copy(a, device=torch.device("cpu"), dtype=6, layout=0)
 
@@ -5751,14 +5678,12 @@ for dtype in (torch.int32, torch.int64):
             ),
         )
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_to_device_constant(self):
-        target_device = _get_accelerator_device_type(self.device)
-
         def fn(a):
             d1 = a.device.type
             if d1 == "cpu":
-                d2 = target_device
+                d2 = GPU_TYPE
             else:
                 d2 = "cpu"
 
@@ -5774,16 +5699,14 @@ for dtype in (torch.int32, torch.int64):
             (torch.randn([10]),),
         )
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_to_copy_fp64_to_no_fp64_device(self):
         # See https://github.com/pytorch/pytorch/issues/180664
         # When the target device does not support fp64, _to_copy should
         # convert dtype on CPU before the device transfer so that no fp64
         # buffer is allocated on the target device.
-        target_device = _get_accelerator_device_type(self.device)
-
         def fn(x):
-            return x.to(dtype=torch.float32, device=target_device)
+            return x.to(dtype=torch.float32, device=GPU_TYPE)
 
         x = torch.randn(4, 4, dtype=torch.float64, device="cpu")
         with patch("torch._inductor.utils.device_supports_fp64", return_value=False):
@@ -5794,21 +5717,19 @@ for dtype in (torch.int32, torch.int64):
         code = "\n".join(code)
         self.assertNotIn("'*fp64'", code)
 
-    @requires_accelerator()
+    @requires_gpu()
     @xfail_if_triton_cpu
     def test_multi_device(self):
-        target_device = _get_accelerator_device_type(self.device)
-
         def fn(x):
             x = x + 1
             x = x + 2
-            x = x.to(device=target_device)
+            x = x.to(device=GPU_TYPE)
             x = x + 3
             x = x + 4
             x = x.cpu()
             x = x + 5
             x = x + 6
-            x = x.to(device=target_device)
+            x = x.to(device=GPU_TYPE)
             x = x + 7
             x = x + 8
             x = x.cpu()
@@ -5825,12 +5746,11 @@ for dtype in (torch.int32, torch.int64):
     @requires_multigpu()
     def test_multi_gpu_device(self):
         # TODO: https://github.com/pytorch/pytorch/issues/92627
-        target_device = _get_accelerator_device_type(self.device)
-        x = torch.rand([4], device=target_device)
+        x = torch.rand([4], device=GPU_TYPE)
 
         def fn(x, y):
             r = torch.ops.aten.div(x, y)
-            r = r.to(f"{target_device}:1")
+            r = r.to(f"{GPU_TYPE}:1")
             return 2 * r
 
         self.common(fn, (torch.randn(4), torch.randn(4)), check_lowp=False)
@@ -5850,14 +5770,13 @@ for dtype in (torch.int32, torch.int64):
 
         gemm_opt = torch._dynamo.optimize("inductor", guard_fail_fn=fail)(gemm)
 
-        target_device = _get_accelerator_device_type(self.device)
-        x0 = torch.randn(1024, 1024, device=f"{target_device}:0")
-        y0 = torch.randn(1024, 1024, device=f"{target_device}:0")
+        x0 = torch.randn(1024, 1024, device=f"{GPU_TYPE}:0")
+        y0 = torch.randn(1024, 1024, device=f"{GPU_TYPE}:0")
 
         gemm_opt(x0, y0)
 
-        x1 = torch.randn(1024, 1024, device=f"{target_device}:1")
-        y1 = torch.randn(1024, 1024, device=f"{target_device}:1")
+        x1 = torch.randn(1024, 1024, device=f"{GPU_TYPE}:1")
+        y1 = torch.randn(1024, 1024, device=f"{GPU_TYPE}:1")
 
         gemm_opt(x1, y1)
         self.assertTrue(failed_guard is not None)
@@ -6417,7 +6336,7 @@ for dtype in (torch.int32, torch.int64):
         )
         assertGeneratedKernelCountEqual(self, 0)
 
-    @requires_accelerator()
+    @requires_gpu()
     @skip_if_gpu_halide  # slow
     @xfail_if_mps  # Non-divisible input sizes are not implemented on MPS device
     @parametrize("comprehensive_padding", (False, True))
@@ -9762,14 +9681,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             rtol=1.3e-06,
         )
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_grid_sampler_expand_preserves_view(self):
-        if (
-            not self.device.startswith("cuda")
-            and not self.device.startswith("xpu")
-            and not _is_privateuse1_device(self.device)
-        ):
-            self.skipTest("requires CUDA, XPU, or PrivateUse1")
+        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+            self.skipTest("requires a supported accelerator")
 
         torch.manual_seed(0)
         torch._dynamo.reset()
@@ -10241,7 +10156,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     # The following 2 tests are meant to check the logic that drops
     # xmask from triton load/store if xnumel = 1
-    @requires_accelerator()
+    @requires_gpu()
     def test_single_elem(self):
         def fn(a):
             b = a + 1
@@ -10249,7 +10164,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.common(fn, (torch.randn(1),))
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_single_elem_indirect(self):
         def fn(a, b):
             c = a[b] + 1
@@ -10263,7 +10178,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # This test is meant to check for issues from the logic
     # that drops xmask from trito load/store if XBLOCK divides xnumel
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_xblock_divides_xnumel(self):
         def fn(a):
             b = a + 1
@@ -12461,7 +12376,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(a0.shape, a1.shape)
         self.assertEqual(a0.stride(), a1.stride())
 
-    @requires_accelerator()
+    @requires_gpu()
     @skip_if_triton_cpu("Flaky on Triton CPU")
     def test_like_rands3(self):
         # rand_like with `device` which is different from `x.device`
@@ -12473,10 +12388,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             x = torch.ones(10, device=device1, dtype=torch.float32)
             return fn(x, device2).clone()
 
-        target_device = _get_accelerator_device_type(self.device)
-        a0 = test_like_rands_on_different_device("cpu", target_device)
-        a1 = test_like_rands_on_different_device(target_device, "cpu")
-        self.assertTrue(a0.device.type == target_device)
+        a0 = test_like_rands_on_different_device("cpu", GPU_TYPE)
+        a1 = test_like_rands_on_different_device(GPU_TYPE, "cpu")
+        self.assertTrue(a0.device.type == GPU_TYPE)
         self.assertTrue(a1.device.type == "cpu")
         self.assertEqual(a0.shape, a1.shape)
         self.assertEqual(a0.stride(), a1.stride())
@@ -13153,7 +13067,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         t1[:, 100] = float("nan")
         self.common(fn, (t1,))
 
-    @requires_cuda
+    @requires_gpu_and_triton
     def test_max_min_bool(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/174069
         # and https://github.com/pytorch/pytorch/issues/184893
@@ -13357,7 +13271,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, args, atol=1e-5, rtol=1e-5)
 
     @xfail_if_mps_unimplemented  # embedding bag
-    @requires_accelerator()
+    @requires_gpu()
     @skip_if_halide  # cascading accuracy issues due rsqrt fallback
     def test_tmp_not_defined_issue3(self):
         test_device = torch.device(type=self.device)
@@ -13796,10 +13710,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # Shape padding causes the inputs to all get specialized, so the codegen
     # test fails
     @expectedFailureCodegenDynamic
-    @requires_accelerator()
+    @requires_gpu()
     @torch._inductor.config.patch("shape_padding", True)
     def test_shape_padding(self):
-        target_device = _get_accelerator_device_type(self.device)
         dtypes = [
             torch.float16,
             torch.float32,
@@ -13808,7 +13721,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         b, m, n, k = 7, 11, 13, 15
 
         def gen(*shape, dtype=torch.float32):
-            return torch.randn(*shape, device=target_device, dtype=dtype) / k + 1.0
+            return torch.randn(*shape, device=GPU_TYPE, dtype=dtype) / k + 1.0
 
         for dtype in dtypes:
             x = gen(m, k, dtype=dtype)
@@ -13826,7 +13739,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(lambda x, y: torch.matmul(x, y), (x, y))
             self.common(lambda x, y, z: torch.baddbmm(z, x, y), (x, y, z))
 
-    @requires_accelerator()
+    @requires_gpu()
     @torch._inductor.config.patch("layout_optimization", True)
     @tf32_on_and_off(0.005)
     def test_inductor_layout_optimization_input_mutations(self):
@@ -13997,7 +13910,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             f"second compilation has hint {HINT_A}; stale cache hit",
         )
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_stride_preservation_with_stride_modifying_fx_pass(self):
         def f(x):
             return x + 1
@@ -14033,7 +13946,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ):
             f_compiled = torch.compile(f)
 
-            x = torch.rand(4, 4, device=_get_accelerator_device_type(self.device))
+            x = torch.rand(4, 4, device=GPU_TYPE)
             y = f(x)
             y_compiled = f_compiled(x)
 
@@ -15468,7 +15381,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(fn(x, boundaries, right), expected)
             self.common(fn, (x, boundaries, right), check_lowp=False)
 
-    @requires_accelerator()
+    @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment(self):
         def fn(x: torch.Tensor) -> torch.Tensor:
@@ -15495,7 +15408,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 res2 = fn_c(inp2)
                 self.assertEqual(ref2, res2, atol=1e-5, rtol=1e-5)
 
-    @requires_accelerator()
+    @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment_recompiles(self):
         # Inputs:
@@ -15542,7 +15455,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # see Note: [Input Alignment handling in Inductor]
         self.assertLessEqual(len(failed_guards), failed_guard_count_iteration_2)
 
-    @requires_accelerator()
+    @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment_cudagraphs(self):
         def fn(x):
@@ -15920,7 +15833,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # No error
         f(x)
 
-    @requires_accelerator()
+    @requires_gpu()
     @torch._inductor.config.patch("layout_optimization", True)
     @torch._inductor.config.patch("keep_output_stride", False)
     @config.patch(implicit_fallbacks=True)
@@ -16147,7 +16060,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             compiled_inductor_out = compiled_inductor_f(x)
             self.assertEqual(compiled_inductor_out, eager_out)
 
-    @requires_accelerator()
+    @requires_gpu()
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fixed_layout_channels_last(self):
         class Block(nn.Module):
@@ -16170,12 +16083,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 out = torch.ops.test.baz(out)
                 return out
 
-        target_device = _get_accelerator_device_type(self.device)
         model = Block()
-        model = model.to(target_device).to(memory_format=torch.channels_last)
-        input_t = torch.randn(
-            [1, 320, 128, 128], dtype=torch.float32, device=target_device
-        )
+        model = model.to(GPU_TYPE).to(memory_format=torch.channels_last)
+        input_t = torch.randn([1, 320, 128, 128], dtype=torch.float32, device=GPU_TYPE)
         input_t = input_t.to(memory_format=torch.channels_last)
         expected_strides = model.helper(input_t).stride()
 
@@ -16342,7 +16252,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(ref, actual)
         self.assertTrue(called)
 
-    @requires_accelerator()
+    @requires_gpu()
     @parametrize("inplace", [False, True])
     def test_index_add_device_mismatch(self, inplace):
         if self.device == "cpu":
@@ -16511,7 +16421,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             FileCheck().check("aten.view.dtype(reinterpret_tensor").run(code[0])
 
     @xfail_if_triton_cpu
-    @requires_accelerator()
+    @requires_gpu()
     def test_scalar_cpu_tensor_arg(self):
         def fn(x, y):
             return x + y.sum()
@@ -17108,13 +17018,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(compiled_out.shape, torch.Size([1, 1, 0, 0]))
         self.assertEqual(eager_out, compiled_out)
 
-    @requires_accelerator()
+    @requires_gpu_and_triton
     def test_lazy_conv_zero_in_channels_backward(self):
-        target_device = _get_accelerator_device_type(self.device)
         for dim in (1, 2, 3):
             conv_cls = getattr(torch.nn, f"LazyConv{dim}d")
-            model = conv_cls(2, kernel_size=1).eval().to(target_device)
-            x = torch.randn(1, 0, *([8] * dim), device=target_device)
+            model = conv_cls(2, kernel_size=1).eval().to(GPU_TYPE)
+            x = torch.randn(1, 0, *([8] * dim), device=GPU_TYPE)
 
             y = torch.compile(model)(x)
             self.assertEqual(y.shape, torch.Size([1, 0, *([8] * dim)]))
@@ -17126,7 +17035,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(model.bias.grad.shape, model.bias.shape)
             self.assertEqual(model.bias.grad, torch.zeros_like(model.bias))
 
-    @requires_accelerator()
+    @requires_gpu()
     @config.patch(fallback_random=True)
     def test_mix_device_index(self):
         """
@@ -17134,9 +17043,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         whose root cause is Inductor having wrong assumption of index.Tensor's output
         stride.
         """
-        target_device = _get_accelerator_device_type(self.device)
         image_latent = (
-            torch.randn((24, 16, 32, 32), device=target_device)
+            torch.randn((24, 16, 32, 32), device=GPU_TYPE)
             .to(memory_format=torch.channels_last)
             .view(2, 12, 16, 32, 32)
         )
@@ -18586,7 +18494,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         code = " ".join(code)
         self.assertIn("tl.fma", code, "Expected FMA to be used in generated code")
 
-    @requires_cuda_and_triton
+    @requires_gpu_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_type_promotion(self):
         """Test that addcmul correctly promotes types when inputs have different dtypes."""
@@ -18782,7 +18690,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         expected = torch.tensor([[311.0], [1.0]])
         self.assertEqual(out, expected)
 
-    @requires_accelerator()
+    @requires_gpu()
     def test_device_context_with_python_scalar(self):
         from torch.utils._device import DeviceContext
 
@@ -18975,8 +18883,8 @@ if RUN_GPU or HAS_MPS:
         common = check_model_gpu
         device = GPU_TYPE
 
-        @requires_cuda_and_triton
-        def test_signbit_negative_zero_cuda(self):
+        @requires_gpu_and_triton
+        def test_signbit_negative_zero(self):
             def fn(x):
                 return torch.signbit(x)
 
@@ -19335,7 +19243,7 @@ if RUN_GPU:
                 torch._inductor.aot_compile(traced, inputs)
 
         @skipCUDAIf(not SM90OrLater, "Requires sm90")
-        @requires_cuda_and_triton
+        @requires_gpu_and_triton
         @unittest.skipIf(TEST_WITH_ROCM, "no grouped_mm support")
         @config.patch(implicit_fallbacks=True)
         def test_grouped_mm(self):
@@ -19345,7 +19253,7 @@ if RUN_GPU:
                     a, b.transpose(-2, -1), offs=offs, out_dtype=out_dtype
                 )
 
-            device = "cuda"
+            device = GPU_TYPE
             dtype = torch.bfloat16
 
             m, n, k, n_groups = 16, 32, 16, 4
@@ -20613,9 +20521,8 @@ if RUN_GPU:
             _, (code,) = run_and_get_code(f, inp)
 
             if config.cpp_wrapper:
-                FileCheck().check_count(
-                    "AOTICudaGuard device_guard(0)", 1, exactly=True
-                ).run(code)
+                guard = "Guard device_guard(0)"
+                FileCheck().check_count(guard, 1, exactly=True).run(code)
             else:
                 FileCheck().check_count(
                     f"with torch.{GPU_TYPE}._DeviceGuard(0)", 1, exactly=True
@@ -21151,15 +21058,6 @@ if RUN_CPU:
                         ret_opt = fn_opt(pytype, dtype)
 
                 self.assertEqual(ret_opt, fn(pytype, dtype))
-
-
-def _get_accelerator_device_type(device: str) -> str:
-    if device != "cpu":
-        return device
-    device_type = _current_accelerator_device_type()
-    if device_type is None:
-        raise unittest.SkipTest("requires accelerator")
-    return device_type
 
 
 def _strip_tmp_path(code: str) -> str:
