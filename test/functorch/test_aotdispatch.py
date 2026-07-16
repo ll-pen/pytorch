@@ -103,6 +103,11 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.custom_tensor import ConstantExtraMetadataTensor
 from torch.testing._internal.hop_db import hop_db
+from torch.testing._internal.inductor_utils import (
+    GPU_TYPE,
+    HAS_GPU_AND_TRITON,
+    requires_gpu,
+)
 from torch.testing._internal.optests import (
     _test_aot_autograd_forwards_backwards_helper,
     aot_autograd_check,
@@ -763,6 +768,11 @@ def forward(self, primals_1):
 
             m.impl("foo", autocast, "AutocastCPU")
             m.impl("foo", autocast, "AutocastCUDA")
+            accelerator_autocast_key = (
+                f"Autocast{torch._C._dispatch_key_for_device(GPU_TYPE)}"
+            )
+            if accelerator_autocast_key != "AutocastCUDA":
+                m.impl("foo", autocast, accelerator_autocast_key)
 
             foo = torch.ops.mylib.foo.default
 
@@ -797,8 +807,8 @@ def forward(self, primals_1):
     @torch._functorch.config.patch(backward_pass_autocast="same_as_forward")
     def test_backward_pass_autocast_on(self):
         devices = ["cpu"]
-        if torch.cuda.is_available():
-            devices.append("cuda")
+        if torch.accelerator.is_available():
+            devices.append(GPU_TYPE)
         for device in devices:
             out, grad = self._compile_autocast(device, forward_autocast=True)
             self.assertEqual(out, torch.zeros_like(out))
@@ -807,8 +817,8 @@ def forward(self, primals_1):
     @torch._functorch.config.patch(backward_pass_autocast="off")
     def test_backward_pass_autocast_off(self):
         devices = ["cpu"]
-        if torch.cuda.is_available():
-            devices.append("cuda")
+        if torch.accelerator.is_available():
+            devices.append(GPU_TYPE)
         for device in devices:
             out, grad = self._compile_autocast(device, forward_autocast=True)
             self.assertEqual(out, torch.zeros_like(out))
@@ -817,8 +827,8 @@ def forward(self, primals_1):
     @torch._functorch.config.patch(backward_pass_autocast="off")
     def test_backward_pass_autocast_custom(self):
         devices = ["cpu"]
-        if torch.cuda.is_available():
-            devices.append("cuda")
+        if torch.accelerator.is_available():
+            devices.append(GPU_TYPE)
         for device in devices:
             with torch._functorch.config.patch(
                 backward_pass_autocast=[{"device_type": device}]
@@ -3312,7 +3322,7 @@ def forward(self, arg0_1, arg1_1):
             """aot_autograd() does not yet handle non-differentiable view input mutations. Aliased inputs share storage but have mixed autograd ._base states: ['input 0 (a)'] have ._base set, while ['input 1 (b)'] have ._base=None (and are not the synthetic base).""",
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     def test_mem_leak_from_save_for_bw(self):
         # See a full diagnosis at this issue: https://github.com/pytorch/pytorch/issues/94990
         # Note [Detaching saved tensors in AOTAutograd]
@@ -3332,12 +3342,15 @@ def forward(self, arg0_1, arg1_1):
 
         f_compiled = aot_function(f, nop)
         inps = [
-            torch.ones(8, 8, device="cuda", requires_grad=True),
-            torch.ones(1, 4, 1, device="cuda", requires_grad=True),
+            torch.ones(8, 8, device=GPU_TYPE, requires_grad=True),
+            torch.ones(1, 4, 1, device=GPU_TYPE, requires_grad=True),
         ]
-        mem_before = torch.cuda.memory_allocated()
+        device_module = torch.get_device_module(GPU_TYPE)
+        if not hasattr(device_module, "memory_allocated"):
+            self.skipTest("requires accelerator memory accounting")
+        mem_before = device_module.memory_allocated()
         f_compiled(*inps)
-        mem_after = torch.cuda.memory_allocated()
+        mem_after = device_module.memory_allocated()
         self.assertTrue(mem_after == mem_before)
 
     def test_output_aliases_multiple_inputs_get_correct_one(self):
@@ -3699,14 +3712,14 @@ def forward(self, primals_1, primals_2, primals_3):
             f, partial(inp_callable, req_grad=True), test_mutation=True
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     def test_synthetic_base_base_attribute_is_none(self):
         def f(a, b):
             a.add_(1)
             return a + b
 
         def inp_callable():
-            base = torch.ones(4, 4, device="cuda")
+            base = torch.ones(4, 4, device=GPU_TYPE)
             # detach() so that none of the inputs have a ._base attribute.
             a = base[0].detach()
             b = base[1].detach()
@@ -4134,14 +4147,14 @@ def forward(self, tangents_1):
 
         self.verify_aot_autograd(f, [torch.randn(3)])
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     def test_autocast_disable_guard(self):
         with torch._C._DisableAutocast():
-            x = torch.rand([4, 4]).cuda()
+            x = torch.rand([4, 4], device=GPU_TYPE)
             y = x @ x
             self.assertEqual(y.dtype, torch.float32)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     def test_nonidempotent_amp(self):
         def f(self_s_emb, add_3):
             einsum_2 = torch.functional.einsum("ah,th->t", self_s_emb, add_3)
@@ -4149,14 +4162,14 @@ def forward(self, tangents_1):
             return (log_softmax_2,)
 
         args = [
-            torch.rand((1, 256), dtype=torch.float32, device="cuda"),
-            torch.rand((30, 256), dtype=torch.float16, device="cuda"),
+            torch.rand((1, 256), dtype=torch.float32, device=GPU_TYPE),
+            torch.rand((30, 256), dtype=torch.float16, device=GPU_TYPE),
         ]
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast(GPU_TYPE, enabled=True):
             self.verify_aot_autograd(f, args)
 
         args = [e.requires_grad_(True) for e in args]
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.autocast(GPU_TYPE, enabled=True):
             self.verify_aot_autograd(f, args)
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
@@ -4795,12 +4808,12 @@ def forward(self, tangents_1):
         counters.clear()
         torch._dynamo.reset()
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="no_static")
     @torch._functorch.config.patch(recompute_views=True)
     def test_saved_tensors_hooks_mutations_raise(self):
         ctx = torch.autograd.graph.saved_tensors_hooks
-        device = "cuda"
+        device = GPU_TYPE
 
         class SAF(torch.autograd.Function):
             @staticmethod
@@ -6770,17 +6783,17 @@ def forward(self, primals_1, tangents_1):
         aot_fn(x)
         self.assertTrue(inference_graph_cell[0] is not None)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     @unittest.skipIf(not USE_TORCHVISION, "test requires torchvision")
     def test_autocast(self):
-        mod = torchvision.models.resnet18().cuda()
+        mod = torchvision.models.resnet18().to(GPU_TYPE)
         mod.train()
 
-        x = torch.randn(16, 3, 32, 32, device="cuda")
+        x = torch.randn(16, 3, 32, 32, device=GPU_TYPE)
         aot_mod = memory_efficient_fusion(mod)
 
         # Ensure that AOT Autograd works with AMP
-        with torch.cuda.amp.autocast(True):
+        with torch.autocast(GPU_TYPE):
             res = aot_mod(x)
         res.sum().backward()
 
@@ -9701,8 +9714,7 @@ def forward(self, primals_1, tangents_1):
             [0, 1, 2],
         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_gpu()
     def test_register_hook_in_checkpoint_accumulated_grad(self):
         def body(y):
             y.register_hook(lambda grad: grad * 0.5)
@@ -9713,7 +9725,7 @@ def forward(self, primals_1, tangents_1):
             z = torch.utils.checkpoint.checkpoint(body, y, use_reentrant=False)
             return z + y
 
-        x = torch.randn(4, device="cuda", requires_grad=True)
+        x = torch.randn(4, device=GPU_TYPE, requires_grad=True)
         out = fn(x)
         out.sum().backward()
         eager_grad = x.grad.clone()
@@ -10612,7 +10624,11 @@ class GradsNoForceContiguousContextManager(ContextDecorator):
         def log_tangents_memory_format_log_meta(a):
             return a.clone()
 
-        for backend in ["CPU", "CUDA"]:
+        backends = ["CPU", "CUDA"]
+        accelerator_backend = torch._C._dispatch_key_for_device(GPU_TYPE)
+        if accelerator_backend not in backends:
+            backends.append(accelerator_backend)
+        for backend in backends:
             self.lib.impl(
                 "log_tangents_memory_format", log_tangents_memory_format_impl, backend
             )
@@ -11468,7 +11484,7 @@ Expected a .* tangent but got a plain Tensor.""",
             self.assertEqual(ref_x.grad, x.grad)
 
     @patch("torch._functorch.config.guess_tangent_strides_as_outputs", True)
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @unittest.skipIf(not HAS_GPU_AND_TRITON, "requires GPU and Triton")
     def test_flex_attn_noncontiguous_tangents(self):
         with GradsNoForceContiguousContextManager() as ctx:
             E = 16  # embedding dim
@@ -11496,12 +11512,12 @@ Expected a .* tangent but got a plain Tensor.""",
 
                     return y.transpose(1, 2).contiguous().view(B, T, E)
 
-            m = M().cuda()
+            m = M().to(GPU_TYPE)
             B = 1
             T = 8
 
             def _inp():
-                return torch.randn(B, T, E, requires_grad=True, device="cuda")
+                return torch.randn(B, T, E, requires_grad=True, device=GPU_TYPE)
 
             x = _inp()
             y = m(x)
@@ -11847,10 +11863,14 @@ Expected a .* tangent but got a plain Tensor.""",
                 self.assertTrue([2, 2, 2] in logged_shapes)
                 self.assertTrue(torch.float64 in logged_dtypes)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
+    @requires_gpu()
     @torch._functorch.config.patch(saved_tensors_hooks_filtering_mode="all")
     def test_saved_tensors_hooks_recompile(self):
+        device_module = torch.get_device_module(GPU_TYPE)
+        supports_bf16 = getattr(device_module, "is_bf16_supported", None)
+        if supports_bf16 is None or not supports_bf16():
+            self.skipTest("requires bfloat16 support")
+
         ctx = torch.autograd.graph.saved_tensors_hooks
 
         def pack_bf16(x):
@@ -11897,7 +11917,7 @@ Expected a .* tangent but got a plain Tensor.""",
                 x = AF.apply(x)
                 return x
 
-            device = torch.device("cuda:0")
+            device = torch.device(GPU_TYPE, 0)
 
             def inp_fn():
                 x = torch.ones(2, 3, device=device, requires_grad=True)
