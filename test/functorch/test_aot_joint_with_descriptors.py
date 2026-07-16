@@ -39,12 +39,12 @@ from torch._functorch.aot_autograd import (
 from torch._guards import tracing, TracingContext
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from torch.testing._internal.common_utils import (
-    requires_cuda,
     run_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
     TestCase,
 )
+from torch.testing._internal.inductor_utils import GPU_TYPE, requires_gpu
 
 
 def graph_capture(model, inputs, with_export):
@@ -829,7 +829,7 @@ class inner_f(torch.nn.Module):
 ('call_function', 't_3', {'pp_stage': 0})""",
             )
 
-    @requires_cuda
+    @requires_gpu()
     def test_preserve_annotate_flex_attention(self):
         def score_mod(score, b, h, m, n):
             return score
@@ -845,7 +845,7 @@ class inner_f(torch.nn.Module):
         b = 24
         batch_size = 2
         seqlen = a * b
-        device = "cuda"
+        device = GPU_TYPE
 
         # Create seq_idx tensor - maps each position to a document/sequence ID
         # Example: Split sequence into 2 documents for each batch
