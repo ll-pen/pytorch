@@ -218,7 +218,7 @@ class TritonExtensionBackendTests(BaseExtensionBackendTests):
         def add(x, y):
             return x + y
 
-        x = torch.zeros((32,), device=GPU_TYPE)
+        x = torch.zeros((32,), device=TRITON_DEVICE_TYPE)
         y = x
         compiled_add = torch.compile(add)
 
@@ -258,7 +258,7 @@ class TritonExtensionBackendTests(BaseExtensionBackendTests):
             add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=16)
             return output
 
-        args = [torch.randn(32, device=GPU_TYPE) for _ in range(2)]
+        args = [torch.randn(32, device=TRITON_DEVICE_TYPE) for _ in range(2)]
         code = run_and_get_triton_code(torch.compile(add), *args)
 
         FileCheck().check("import extension_triton_heuristics").check(
