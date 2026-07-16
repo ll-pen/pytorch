@@ -680,7 +680,7 @@ class TestArgumentCloneAndRestore(TestCase):
 
     def _create_tensor(self, pad=1, with_offset=False):
         """
-        Create a GPU tensor of about 1GB size.
+        Create an accelerator tensor of about 1GB size.
         """
         M = 2
         N = 2**29 // 4
@@ -689,32 +689,33 @@ class TestArgumentCloneAndRestore(TestCase):
             out = out[:, 1:]
         return out
 
-    def _do_test(self, gpu_tensor):
-        torch.get_device_module(GPU_TYPE).reset_peak_memory_stats()
+    def _do_test(self, device_tensor):
+        device_module = torch.get_device_module(device_tensor.device)
+        device_module.reset_peak_memory_stats()
         autotuner = self._create_caching_autotuner()
 
-        old_storage_offset = gpu_tensor.storage_offset()
-        gpu_tensor_clone = clone_preserve_strides(gpu_tensor)
+        old_storage_offset = device_tensor.storage_offset()
+        device_tensor_clone = clone_preserve_strides(device_tensor)
 
-        peak_mem_before = torch.get_device_module(GPU_TYPE).max_memory_allocated()
-        cpu_copies = autotuner.copy_args_to_cpu_if_needed(gpu_tensor)
+        peak_mem_before = device_module.max_memory_allocated()
+        cpu_copies = autotuner.copy_args_to_cpu_if_needed(device_tensor)
         self.assertTrue(len(cpu_copies) == 1)
 
         # Mutate the arg
-        gpu_tensor.add_(1)
+        device_tensor.add_(1)
 
-        # will restore gpu_tensor
+        # Restore the mutated input from the CPU copy.
         autotuner.restore_args_from_cpu(cpu_copies)
-        self.assertTrue(gpu_tensor is not gpu_tensor_clone)
-        self.assertEqual(gpu_tensor.size(), gpu_tensor_clone.size())
-        self.assertEqual(gpu_tensor.stride(), gpu_tensor_clone.stride())
-        self.assertEqual(gpu_tensor.storage_offset(), old_storage_offset)
+        self.assertTrue(device_tensor is not device_tensor_clone)
+        self.assertEqual(device_tensor.size(), device_tensor_clone.size())
+        self.assertEqual(device_tensor.stride(), device_tensor_clone.stride())
+        self.assertEqual(device_tensor.storage_offset(), old_storage_offset)
 
         # Note: torch.allclose somehow allocates large amount of extra memory.
         # Record peak memory before that.
-        peak_mem_after = torch.get_device_module(GPU_TYPE).max_memory_allocated()
+        peak_mem_after = device_module.max_memory_allocated()
 
-        self.assertTrue(torch.allclose(gpu_tensor, gpu_tensor_clone))
+        self.assertTrue(torch.allclose(device_tensor, device_tensor_clone))
         self.assertTrue(
             peak_mem_after <= peak_mem_before + self.MEM_TOLERANCE,
             f"{peak_mem_before=} v.s. {peak_mem_after=}",
