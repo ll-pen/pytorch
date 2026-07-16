@@ -93,6 +93,11 @@ if HAS_GPU:
             fast_dividef,
             fast_dividef as my_fast_dividef,
         )
+    else:
+        from triton.language.extra.libdevice import (  # @manual
+            fast_dividef,
+            fast_dividef as my_fast_dividef,
+        )
 
     def _triton_get_ast_equal_to_str(params):
         try:
@@ -283,10 +288,16 @@ class KernelTests(torch._inductor.test_case.TestCase):
         self.assertIsNone(_re.search(r"\b__dunder_add_kernel_0\b", code))
         self.assertIsNotNone(_re.search(r"\b_dunder_add_kernel_0\b", code))
 
-    @requires_cuda_and_triton
+    @skipIfXpu(msg="Not enabled on XPU")
+    @requires_gpu
     def test_dim_max_min_reuse_argreduce_value(self):
         dtypes = [torch.float32, torch.float16]
-        if torch.cuda.is_bf16_supported(including_emulation=False):
+        device_module = torch.get_device_module(GPU_TYPE)
+        if GPU_TYPE == "cuda":
+            supports_bf16 = device_module.is_bf16_supported(including_emulation=False)
+        else:
+            supports_bf16 = device_module.is_bf16_supported()
+        if supports_bf16:
             dtypes.append(torch.bfloat16)
 
         for op, indexed_helper, value_helper, selected_value in (
@@ -771,7 +782,8 @@ def forward(self, x_1, output_1):
             self.assertEqual(output_code.count('float("nan")'), 0)
             self.assertEqual(output_code.count("float('nan')"), 0)
 
-    @requires_cuda_and_triton
+    @skipIfXpu(msg="Not enabled on XPU")
+    @requires_gpu
     def test_fp_self_sub_rewrite_preserves_nonfinite_semantics(self):
         def fn(x):
             a = x * x
@@ -792,7 +804,8 @@ def forward(self, x_1, output_1):
         actual = torch.compile(fn, fullgraph=True)(special)
         torch.testing.assert_close(actual, expected, equal_nan=True)
 
-    @requires_cuda_and_triton
+    @skipIfXpu(msg="Not enabled on XPU")
+    @requires_gpu
     @common_utils.parametrize("per_subkernel", [False, True])
     def test_combo_fp_self_sub_rewrite(self, per_subkernel):
         def fn(a, b):
@@ -819,7 +832,8 @@ def forward(self, x_1, output_1):
         self.assertIn("tl.where", code)
         self.assertNotIn("'enable_fp_fusion': False", code)
 
-    @requires_cuda_and_triton
+    @skipIfXpu(msg="Not enabled on XPU")
+    @requires_gpu
     def test_duplicate_mse_loss_operands_are_zero(self):
         torch.manual_seed(0)
         x = torch.randn(10000, device=GPU_TYPE)
@@ -3178,7 +3192,7 @@ def forward(self, arg0_1, arg1_1):
 
     # TODO enable this test case on XPU.
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/180126")
-    @requires_gpu_and_triton
+    @requires_gpu
     @parametrize("cfg", ["normal", "cpp_wrapper"])
     def test_triton_kernel_dtype_view(self, cfg):
         # https://github.com/pytorch/pytorch/issues/136159
