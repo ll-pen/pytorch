@@ -8,7 +8,12 @@ from functorch import make_fx
 from functorch.compile import minifier
 from torch._functorch.compile_utils import get_outputs, get_placeholders
 from torch._functorch.fx_minifier import dump_state
-from torch.testing._internal.common_utils import run_tests, TestCase
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+    run_tests,
+    TestCase,
+)
 
 
 class TestMinifier(TestCase):
@@ -121,7 +126,8 @@ class TestMinifier(TestCase):
         if len(inps) != 1:
             raise AssertionError(f"Expected 1 input, got {len(inps)}")
 
-    def test_dump_state_preserves_device_index(self):
+    @parametrize("device", ["cuda:7", "privateuseone:7"])
+    def test_dump_state_preserves_device_index(self, device):
         graph = torch.fx.Graph()
         x = graph.placeholder("x")
         graph.output(x)
@@ -132,7 +138,7 @@ class TestMinifier(TestCase):
             torch._subclasses.fake_tensor.FakeTensorConverter().from_meta_and_device(
                 fake_mode,
                 torch.empty_strided((2, 3), (3, 1), device="meta"),
-                torch.device("cuda:7"),
+                torch.device(device),
             )
         )
 
@@ -141,7 +147,10 @@ class TestMinifier(TestCase):
             dump_state(gm, [fake_tensor])
 
         repro = buf.getvalue()
-        self.assertIn("'cuda:7'", repro)
+        self.assertIn(f"'{device}'", repro)
+
+
+instantiate_parametrized_tests(TestMinifier)
 
 
 if __name__ == "__main__":
