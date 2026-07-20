@@ -456,7 +456,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             )
             for _ in range(3):  # warmup iters before cudagraph capture kicks in
                 self.assertEqual(compiled(inp), expected)
-            torch.accelerator.synchronize(self.device)
+            torch.cuda.synchronize(device=self.device)
 
     def test_c10d_functional_tagged_pt2_compliant(self):
         op = torch.ops._c10d_functional.all_reduce.default
