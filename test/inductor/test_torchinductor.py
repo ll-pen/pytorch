@@ -20521,8 +20521,9 @@ if RUN_GPU:
             _, (code,) = run_and_get_code(f, inp)
 
             if config.cpp_wrapper:
-                guard = "Guard device_guard(0)"
-                FileCheck().check_count(guard, 1, exactly=True).run(code)
+                FileCheck().check_count(
+                    "AOTICudaGuard device_guard(0)", 1, exactly=True
+                ).run(code)
             else:
                 FileCheck().check_count(
                     f"with torch.{GPU_TYPE}._DeviceGuard(0)", 1, exactly=True
