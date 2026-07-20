@@ -15,7 +15,7 @@ from torch._dynamo.debug_utils import InputReader
 from torch._inductor import config
 from torch._inductor.choices import InductorChoices
 from torch._inductor.codegen.triton import FixedTritonConfig
-from torch._inductor.runtime.hints import DeviceProperties, TRITON_MAX_BLOCK
+from torch._inductor.runtime.hints import TRITON_MAX_BLOCK
 from torch._inductor.runtime.runtime_utils import get_max_y_grid, is_power_of_2
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
@@ -55,9 +55,12 @@ importlib.import_module("filelock")
 max_block: int = TRITON_MAX_BLOCK["X"]
 
 
-def _get_no_split_threshold(device: torch.device | str) -> int:
-    props = DeviceProperties.create(torch.device(device))
-    return 524288 if props.major is not None and props.major >= 10 else 8192
+def _get_no_split_threshold() -> int:
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        if props.major is not None and props.major >= 10:
+            return 524288
+    return 8192
 
 
 def tma_xfail(*args, extra_decorators=None):
@@ -526,9 +529,7 @@ class CommonTemplate:
         # On SM100+, larger max_block means reductions that previously needed 2
         # kernels now fit in a single persistent kernel with fewer block pointers.
         reduction_numel = math.prod(view_size)
-        if num_triton_kernels == 2 and reduction_numel <= _get_no_split_threshold(
-            self.device
-        ):
+        if num_triton_kernels == 2 and reduction_numel <= _get_no_split_threshold():
             num_triton_kernels = 1
             if num_block_pointers is not None:
                 num_block_pointers = max(num_block_pointers - 2, 0)
@@ -811,9 +812,7 @@ class CommonTemplate:
 
         # On SM100+, these reductions fit in a single persistent kernel.
         reduction_numel = math.prod(view_size)
-        if num_triton_kernels == 2 and reduction_numel <= _get_no_split_threshold(
-            self.device
-        ):
+        if num_triton_kernels == 2 and reduction_numel <= _get_no_split_threshold():
             num_triton_kernels = 1
             num_block_pointers = 1
 
@@ -890,7 +889,7 @@ class CommonTemplate:
         reduction_numel = math.prod(size)
         if (
             expected_num_triton_kernels == 2
-            and reduction_numel <= _get_no_split_threshold(self.device)
+            and reduction_numel <= _get_no_split_threshold()
         ):
             expected_num_triton_kernels = 1
             expected_num_block_pointers = 1
@@ -933,8 +932,9 @@ class CommonTemplate:
         expected_num_triton_kernels = 1 if cooperative_reductions else 2
 
         # On SM100+, these reductions fit in a single persistent kernel.
-        if expected_num_triton_kernels == 2 and view.numel() <= _get_no_split_threshold(
-            self.device
+        if (
+            expected_num_triton_kernels == 2
+            and view.numel() <= _get_no_split_threshold()
         ):
             expected_num_triton_kernels = 1
             expected_num_block_pointers = 0
