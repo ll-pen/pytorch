@@ -120,6 +120,18 @@ from torch.utils._python_dispatch import (
 )
 
 
+_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
+requires_cuda_or_privateuse1 = (
+    requires_gpu()
+    if GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE
+    else unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+)
+requires_sm80_or_privateuse1 = unittest.skipIf(
+    GPU_TYPE != _PRIVATEUSE1_DEVICE_TYPE and not SM80OrLater,
+    "bfloat16, float8",
+)
+
+
 USE_TORCHVISION = False
 try:
     import torchvision
@@ -10089,23 +10101,23 @@ def forward(self, primals_1, tangents_1):
         sg_ops = [n for n in sg_mod.graph.nodes if n.op == "call_function"]
         self.assertEqual(len(sg_ops), 1)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+    @requires_cuda_or_privateuse1
     def test_control_deps_mixed_fwd_bw_deps_e2e(self):
         """Forward compilation and backward must not crash when
         wait_stream's control_deps collects forward deps."""
 
         def fn(x, w):
-            s1 = torch.cuda.Stream()
-            s1.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s1):
+            s1 = torch.Stream(device=GPU_TYPE)
+            s1.wait_stream(torch.accelerator.current_stream())
+            with s1:
                 h = x @ w
-            ev = torch.cuda.Event()
+            ev = torch.Event(device=GPU_TYPE)
             ev.record(s1)
             ev.wait()
             return h
 
-        w = torch.randn(64, 64, device="cuda", requires_grad=True)
-        x = torch.randn(4, 64, device="cuda", requires_grad=True)
+        w = torch.randn(64, 64, device=GPU_TYPE, requires_grad=True)
+        x = torch.randn(4, 64, device=GPU_TYPE, requires_grad=True)
         compiled = torch.compile(fn, backend="aot_eager")
         out = compiled(x, w)
         out.sum().backward()
@@ -11589,8 +11601,8 @@ Expected a .* tangent but got a plain Tensor.""",
             x_grad = pytree.tree_map_only(torch.Tensor, lambda t: t.grad, x)
             self.assertEqual(ref_x_grad, x_grad, atol=1e-2, rtol=1e-2)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
+    @requires_cuda_or_privateuse1
+    @requires_sm80_or_privateuse1
     @parametrize("saved_tensors_hooks_filtering_mode", ["donated", "no_static", "all"])
     def test_saved_tensors_hooks_base(self, saved_tensors_hooks_filtering_mode):
         with patch(
@@ -11639,7 +11651,7 @@ Expected a .* tangent but got a plain Tensor.""",
                 x = SAF.apply(x, y)
                 return x
 
-            device = torch.device("cuda:0")
+            device = torch.device(GPU_TYPE, 0)
 
             def inp_fn():
                 x = torch.ones(2, 2, device=device, requires_grad=True)
@@ -11740,8 +11752,8 @@ Expected a .* tangent but got a plain Tensor.""",
                 #     test_fn, inp_fn, [(pack_wrapper_two_tensor, unpack_wrapper_two_tensor)]
                 # )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
-    @unittest.skipIf(not SM80OrLater, "bfloat16, float8")
+    @requires_cuda_or_privateuse1
+    @requires_sm80_or_privateuse1
     def test_saved_tensors_hooks_params(self):
         with torch.library._scoped_library("_test_aotdispatch_lib", "FRAGMENT") as lib:
             logged_shapes = []
@@ -11756,7 +11768,11 @@ Expected a .* tangent but got a plain Tensor.""",
             def log_meta(x):
                 return x.clone()
 
-            for backend in ["CPU", "CUDA"]:
+            backends = ["CPU", "CUDA"]
+            accelerator_backend = torch._C._dispatch_key_for_device(GPU_TYPE)
+            if accelerator_backend not in backends:
+                backends.append(accelerator_backend)
+            for backend in backends:
                 lib.impl(
                     "log",
                     log_impl,
@@ -11809,7 +11825,7 @@ Expected a .* tangent but got a plain Tensor.""",
                 logged_shapes.clear()
                 logged_dtypes.clear()
 
-            device = torch.device("cuda:0")
+            device = torch.device(GPU_TYPE, 0)
             m = M().to(device=device)
 
             def _test_m():
