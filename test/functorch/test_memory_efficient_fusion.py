@@ -2,6 +2,7 @@
 
 import inspect
 import random
+import unittest
 from collections.abc import Callable
 
 import torch
@@ -12,8 +13,9 @@ from functorch.compile import memory_efficient_fusion
 from torch._functorch.compile_utils import fx_graph_cse
 from torch.nn import functional as F
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch.testing._internal.inductor_utils import GPU_TYPE
-from torch.testing._internal.triton_utils import requires_gpu
+
+
+HAS_CUDA = torch.cuda.is_available()
 
 
 def _num_args(fn: Callable):
@@ -96,7 +98,7 @@ def hard_mish(x):
 
 def run_and_compare_activation(self, fn, inps):
     with torch.jit.fuser("fuser1"):
-        device = GPU_TYPE
+        device = "cuda"
         dtype = torch.float
         if isinstance(fn, nn.Module):
             fn = fn.to(device=device, dtype=dtype)
@@ -122,7 +124,7 @@ def run_and_compare_activation(self, fn, inps):
             self.assertEqual(ref_arg.grad, res_arg.grad)
 
 
-@requires_gpu
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
 class TestMemoryEfficientOpAuthoring(TestCase):
     def test_gelu_bias(self):
         run_and_compare_activation(self, gelu_bias, [(1024,), (1024,)])
