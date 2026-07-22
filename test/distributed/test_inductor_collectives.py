@@ -48,6 +48,7 @@ from torch._subclasses import FakeTensorMode
 from torch.distributed.distributed_c10d import GroupMember
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
+from torch.testing._internal.common_cuda import SM80OrLater
 from torch.testing._internal.common_distributed import (
     _dynamo_dist_per_rank_init,
     DynamoDistributedMultiProcTestCase,
@@ -66,19 +67,6 @@ from torch.testing._internal.common_utils import (
 )
 from torch.testing._internal.inductor_utils import HAS_GPU
 from torch.utils._python_dispatch import TorchDispatchMode
-
-
-def _accelerator_supports_bfloat16() -> bool:
-    accelerator = torch.accelerator.current_accelerator()
-    if accelerator is None:
-        return False
-
-    device_module = torch.get_device_module(accelerator)
-    if not hasattr(device_module, "is_bf16_supported"):
-        return False
-    if accelerator.type == "cuda":
-        return device_module.is_bf16_supported(including_emulation=False)
-    return device_module.is_bf16_supported()
 
 
 # Opaque custom op so torch.compile traces the coalescing manager into the graph
@@ -1881,7 +1869,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             self.assertEqual(stats.moves, 0)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_all_gather_bucket(self, bucket_mode):
         def func(x, w, ag_0, ag_1, ag_2, ag_3, *, tag, ranks, group_size):
@@ -1919,12 +1907,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             ag_3_out = torch.ops.c10d_functional.wait_tensor(ag_3_out)
             return y, ag_0_out, ag_1_out, ag_2_out, ag_3_out
 
-        x = torch.ones(4, 384, device=self.device, dtype=torch.float32)
-        w = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ag_0 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ag_1 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ag_2 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ag_3 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
+        x = torch.ones(4, 384, device="cuda", dtype=torch.float32)
+        w = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ag_0 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ag_1 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ag_2 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ag_3 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
         inputs = [x, w, ag_0, ag_1, ag_2, ag_3]
         correct = func(*inputs, **self.get_world_trs())
 
@@ -1983,7 +1971,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
                 torch.ops.c10d_functional.wait_tensor(ag_2_out),
             )
 
-        inputs = [torch.ones(64, device=self.device) for _ in range(3)]
+        inputs = [torch.ones(64, device="cuda") for _ in range(3)]
         with torch._inductor.config.patch(
             {
                 "bucket_all_gathers_fx": "all",
@@ -2002,7 +1990,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         )
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     def test_all_gather_bucket_path(self):
         def func(x, w, ag_0, ag_1, *, tag, ranks, group_size):
             # do some unrelated matmuls
@@ -2055,7 +2043,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         FileCheck().check_count("wait_tensor.default(", 2, exactly=True).run(code)
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_reduce_scatter_bucket(self, bucket_mode):
         def func(x, w, rs_0, rs_1, tag, ranks, group_size):
@@ -2089,10 +2077,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             return y, rs_0_out.to(torch.float32), rs_1_out.to(torch.float32)
 
         for f in [func, func2]:
-            x = torch.ones(4, 384, device=self.device, dtype=torch.float32)
-            w = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-            rs_0 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-            rs_1 = torch.ones(384, 256, device=self.device, dtype=torch.float32)
+            x = torch.ones(4, 384, device="cuda", dtype=torch.float32)
+            w = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+            rs_0 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+            rs_1 = torch.ones(384, 256, device="cuda", dtype=torch.float32)
             inputs = [x, w, rs_0, rs_1]
             f(*inputs, **self.get_world_trs())
 
@@ -2142,8 +2130,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             rs_1_out = torch.ops._c10d_functional.wait_tensor(rs_1_out)
             return rs_0_out + rs_1_out
 
-        rs_0 = torch.ones(4, 128, device=self.device)
-        rs_1 = torch.ones(4, 128, device=self.device)
+        rs_0 = torch.ones(4, 128, device="cuda")
+        rs_1 = torch.ones(4, 128, device="cuda")
         inputs = [rs_0, rs_1]
 
         with torch._inductor.config.patch(
@@ -2166,7 +2154,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         self.assertTrue(same(out, correct))
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize(
         "bucket_mode", ["all"]
     )  # "all" is just a placeholder, there is only one bucketmode
@@ -2191,10 +2179,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
         f = func
 
-        x = torch.ones(4, 384, device=self.device, dtype=torch.float32)
-        w = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ar_0 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ar_1 = torch.ones(384, 256, device=self.device, dtype=torch.float32)
+        x = torch.ones(4, 384, device="cuda", dtype=torch.float32)
+        w = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ar_0 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ar_1 = torch.ones(384, 256, device="cuda", dtype=torch.float32)
         inputs = [x, w, ar_0, ar_1]
         f(*inputs, **self.get_world_trs())
 
@@ -2224,7 +2212,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError(f"Expected out to match correct: {out} vs {correct}")
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["custom_ops_multidtype"])
     def test_all_gather_bucket_multidtype(self, bucket_mode):
         def func(x, w, ag_0, ag_1, *, tag, ranks, group_size):
@@ -2249,10 +2237,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
             return y, ag_0_out, ag_1_out
 
-        x = torch.ones(4, 384, device=self.device, dtype=torch.float32)
-        w = torch.ones(384, 512, device=self.device, dtype=torch.float32)
-        ag_0 = torch.ones(384, 512, device=self.device, dtype=torch.bfloat16)
-        ag_1 = torch.ones(384, 512, device=self.device, dtype=torch.float32)
+        x = torch.ones(4, 384, device="cuda", dtype=torch.float32)
+        w = torch.ones(384, 512, device="cuda", dtype=torch.float32)
+        ag_0 = torch.ones(384, 512, device="cuda", dtype=torch.bfloat16)
+        ag_1 = torch.ones(384, 512, device="cuda", dtype=torch.float32)
         inputs = [x, w, ag_0, ag_1]
         correct = func(*inputs, **self.get_world_trs())
 
@@ -2289,7 +2277,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError(f"Expected out to match correct: {out} vs {correct}")
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_reorder_peak_memory_bucketed(self, bucket_mode):
         """
@@ -3407,11 +3395,18 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
-    @unittest.skipIf(not _accelerator_supports_bfloat16(), "bfloat16")
+    @unittest.skipIf(not SM80OrLater, "bfloat16")
     def test_schedule_overlap_benchmark(self):
-        self._init_process_group()
+        store = c10d.FileStore(self.file_name, self.world_size)
+        torch.cuda.set_device(self.rank)
+        c10d.init_process_group(
+            backend="nccl", store=store, rank=self.rank, world_size=self.world_size
+        )
         group = c10d.distributed_c10d._get_default_group()
         group_name = "default"
+        torch._C._distributed_c10d._register_process_group(
+            group_name, torch.distributed.group.WORLD
+        )
         group_size = group.size()
 
         def func(x, w, ag_0, ag_1, ag_2, ag_3, group_size, group_name):
@@ -3521,7 +3516,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         Test that overlap scheduling handles async device_put correctly.
 
         This test exercises the pattern from torchtitan's expert_parallel.py:
-        - Compute splits on the accelerator
+        - Compute splits on GPU
         - Transfer to CPU with .to(cpu, non_blocking=True/False)
         - Use the CPU tensors in subsequent operations
 
@@ -3536,9 +3531,14 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         may not manifest in every run, this test verifies the pattern works
         correctly with overlap scheduling.
         """
-        self._init_process_group()
+        store = c10d.FileStore(self.file_name, self.world_size)
+        torch.cuda.set_device(self.rank)
+        c10d.init_process_group(
+            backend="nccl", store=store, rank=self.rank, world_size=self.world_size
+        )
         group = c10d.distributed_c10d._get_default_group()
         group_name = "default"
+        torch._C._distributed_c10d._register_process_group(group_name, group)
         group_size = group.size()
 
         def overlap_pass(graph: torch.fx.Graph) -> torch.fx.GraphModule:
@@ -3579,7 +3579,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
             """
             Pattern from expert_parallel.py:
             1. Exchange token counts via all_to_all
-            2. Compute splits from accelerator tensors and transfer to CPU
+            2. Compute splits from CUDA tensors and transfer to CPU (one async, one sync)
             3. Convert to list with .tolist() and use in all_to_all for data routing
 
             The race condition occurs because:
@@ -3677,9 +3677,14 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         in the FX graph. The benchmark path must convert these to concrete ints
         before calling the collective.
         """
-        self._init_process_group()
+        store = c10d.FileStore(self.file_name, self.world_size)
+        torch.cuda.set_device(self.rank)
+        c10d.init_process_group(
+            backend="nccl", store=store, rank=self.rank, world_size=self.world_size
+        )
         group = c10d.distributed_c10d._get_default_group()
         group_name = "default"
+        torch._C._distributed_c10d._register_process_group(group_name, group)
         group_size = group.size()
 
         HIDDEN = 64
