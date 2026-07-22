@@ -1,7 +1,7 @@
 # Owner(s): ["module: inductor"]
 """Tests for user-annotated stream support in Inductor.
 
-This module tests the infrastructure for supporting user-annotated accelerator stream
+This module tests the infrastructure for supporting user-annotated CUDA stream
 assignments on nodes, including stream utilities, event management, and codegen.
 """
 
@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import torch
 import torch._inductor.config as inductor_config
 import torch._inductor.metrics
-from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._inductor.codegen.cuda.device_op_overrides import CUDADeviceOpOverrides
 from torch._inductor.codegen.wrapper import (
@@ -40,23 +39,6 @@ from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     TEST_WITH_ROCM,
     xfailIfNoAcceleratorTriton,
-)
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
-
-
-_TEST_DEVICE_TYPE = GPU_TYPE
-_TEST_DEVICE_MODULE = torch.get_device_module(_TEST_DEVICE_TYPE)
-_TEST_DEVICE_INTERFACE = get_interface_for_device(_TEST_DEVICE_TYPE)
-_TEST_DEVICE_EXPOSES_STREAMS = _TEST_DEVICE_INTERFACE.exposes_streams()
-requires_accelerator_streams = unittest.skipUnless(
-    HAS_GPU and _TEST_DEVICE_EXPOSES_STREAMS,
-    "requires accelerator stream support",
-)
-requires_two_accelerator_devices = unittest.skipIf(
-    not HAS_GPU
-    or not _TEST_DEVICE_EXPOSES_STREAMS
-    or _TEST_DEVICE_MODULE.device_count() < 2,
-    "requires at least two accelerator devices",
 )
 
 
@@ -318,24 +300,24 @@ with torch.xpu._DeviceGuard(0):
         self.assertTrue(make_line(1).setup_stream_cache)
         self.assertTrue(make_line(0).setup_stream_cache)
 
-    @requires_accelerator_streams
+    @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     def test_generated_code_uses_get_stream_by_index(self):
         """Generated inductor code should use _get_stream_by_index."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = torch.Stream(device=_TEST_DEVICE_TYPE)
+            s = torch.Stream(device="cuda")
             with s:
                 return x + 1
 
-        x = torch.ones(4, 4, device=_TEST_DEVICE_TYPE)
+        x = torch.ones(4, 4, device="cuda")
         result, code = run_and_get_code(torch.compile(fn), x)
         FileCheck().check("_get_stream_by_index").run(code[0])
-        expected = fn(torch.ones(4, 4, device=_TEST_DEVICE_TYPE))
+        expected = fn(torch.ones(4, 4, device="cuda"))
         torch.testing.assert_close(result, expected)
 
 
-@requires_accelerator_streams
+@unittest.skipIf(not TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestUserStreamCompile(InductorTestCase):
     """End-to-end tests for torch.compile with user stream contexts."""
@@ -346,20 +328,20 @@ class TestUserStreamCompile(InductorTestCase):
 
         def fn(x, y):
             # Create a side stream
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
             # Perform operation on default stream
             z = x + y
             # Order the side stream after the default-stream producer before reading z.
-            s.wait_stream(_TEST_DEVICE_MODULE.current_stream())
+            s.wait_stream(torch.cuda.current_stream())
             # Perform operation on side stream
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 w = z * 2
             # Synchronize before using result
             s.synchronize()
             return w + 1
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        y = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
+        y = torch.randn(1024, device="cuda")
 
         # Get expected result from eager execution
         expected = fn(x, y)
@@ -375,18 +357,21 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(_count_generated_stream_contexts(code), 1)
         self.assertIn("synchronize_stream", code)
 
-    @requires_two_accelerator_devices
+    @unittest.skipIf(
+        not TEST_CUDA or torch.cuda.device_count() < 2,
+        "requires at least two CUDA devices",
+    )
     def test_raw_stream_name_does_not_clobber_user_stream_on_cuda_1(self):
         from torch._inductor.utils import run_and_get_code
 
-        device = torch.device(f"{_TEST_DEVICE_TYPE}:1")
-        aux = _TEST_DEVICE_MODULE.Stream(device=device)
-        ev0 = _TEST_DEVICE_MODULE.Event()
-        ev1 = _TEST_DEVICE_MODULE.Event()
+        device = torch.device("cuda:1")
+        aux = torch.cuda.Stream(device=device)
+        ev0 = torch.cuda.Event()
+        ev1 = torch.cuda.Event()
 
         def fn(x, w):
             ev0.record()
-            with _TEST_DEVICE_MODULE.stream(aux):
+            with torch.cuda.stream(aux):
                 ev0.wait()
                 a = torch.mm(x, w)
                 ev1.record()
@@ -394,7 +379,7 @@ class TestUserStreamCompile(InductorTestCase):
             ev1.wait()
             c = (a.sin() * a.cos() + 0.1).relu()
 
-            with _TEST_DEVICE_MODULE.stream(aux):
+            with torch.cuda.stream(aux):
                 d = torch.mm(c, w.t())
 
             return d
@@ -403,10 +388,10 @@ class TestUserStreamCompile(InductorTestCase):
         w = torch.randn(128, 64, device=device)
 
         expected = fn(x, w)
-        _TEST_DEVICE_MODULE.synchronize()
+        torch.cuda.synchronize()
 
         actual, (code,) = run_and_get_code(torch.compile(fn, fullgraph=True), x, w)
-        _TEST_DEVICE_MODULE.synchronize()
+        torch.cuda.synchronize()
 
         self.assertEqual(actual, expected)
         self.assertIn("stream1 = _get_stream_by_index", code)
@@ -418,16 +403,16 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
             # Work on default stream
             a = x * 2
             # Work on side stream
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 b = x * 3
             s.synchronize()
             return a + b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -444,22 +429,22 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
 
             a = x + 1  # default stream
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 b = x * 2  # stream 1
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 c = x * 3  # stream 2
 
             s1.synchronize()
             s2.synchronize()
             return a + b + c
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -476,12 +461,12 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
-                with _TEST_DEVICE_MODULE.stream(s2):
+                with torch.cuda.stream(s2):
                     b = x * 3
                 c = a + 1  # back on s1
 
@@ -489,7 +474,7 @@ class TestUserStreamCompile(InductorTestCase):
             s2.synchronize()
             return a + b + c
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -506,20 +491,20 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
 
             # Compute on default stream
             a = x * 2
 
             # Use result on side stream
-            s.wait_stream(_TEST_DEVICE_MODULE.current_stream())
-            with _TEST_DEVICE_MODULE.stream(s):
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
                 b = a + 1  # depends on 'a' from default stream
 
             s.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -536,15 +521,15 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
             # Compute on default stream
             a = x * 2
             # Record event on default stream
             event.record()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 # Wait for event before using 'a'
                 event.wait()
                 b = a + 1
@@ -552,7 +537,7 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -569,16 +554,16 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
                 # Record on s1
                 event.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 # Wait for s1's work before proceeding
                 event.wait(s2)
                 b = a + 1
@@ -587,7 +572,7 @@ class TestUserStreamCompile(InductorTestCase):
             s2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -604,18 +589,18 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            event1 = _TEST_DEVICE_MODULE.Event()
-            event2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            event1 = torch.cuda.Event()
+            event2 = torch.cuda.Event()
 
             # Work on s1
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
                 event1.record(s1)
 
             # Work on s2, depends on s1
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 event1.wait(s2)
                 b = a + 1
                 event2.record(s2)
@@ -628,7 +613,7 @@ class TestUserStreamCompile(InductorTestCase):
             s2.synchronize()
             return c
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -645,13 +630,13 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
             # Record the event first
             event.record()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 # Wait is valid after record
                 event.wait()
                 a = x * 2
@@ -659,7 +644,7 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return a
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -676,21 +661,21 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
             a = x * 2
             event.record()
 
             # Use stream.wait_event instead of event.wait
             s.wait_event(event)
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 b = a + 1
 
             s.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -706,24 +691,24 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            event_s1 = _TEST_DEVICE_MODULE.Event()
-            event_s2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            event_s1 = torch.cuda.Event()
+            event_s2 = torch.cuda.Event()
 
             # s1 does work
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
                 event_s1.record(s1)
 
             # s2 waits for s1, does work, signals back
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 event_s1.wait(s2)
                 b = a + 1
                 event_s2.record(s2)
 
             # s1 waits for s2
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 event_s2.wait(s1)
                 c = b * 2
 
@@ -731,7 +716,7 @@ class TestUserStreamCompile(InductorTestCase):
             s2.synchronize()
             return c
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -748,25 +733,25 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            s3 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            s3 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             # Stage 1 on s1
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
                 e1.record(s1)
 
             # Stage 2 on s2, depends on s1
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e1.wait(s2)
                 b = a + 1
                 e2.record(s2)
 
             # Stage 3 on s3, depends on s2
-            with _TEST_DEVICE_MODULE.stream(s3):
+            with torch.cuda.stream(s3):
                 e2.wait(s3)
                 c = b * 3
 
@@ -775,7 +760,7 @@ class TestUserStreamCompile(InductorTestCase):
             s3.synchronize()
             return c
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -793,23 +778,23 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            s3 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
-            e3 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            s3 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            e3 = torch.cuda.Event()
 
             # Parallel work on three streams
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x * 2
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = x * 3
                 e2.record(s2)
 
-            with _TEST_DEVICE_MODULE.stream(s3):
+            with torch.cuda.stream(s3):
                 c = x * 4
                 e3.record(s3)
 
@@ -824,7 +809,7 @@ class TestUserStreamCompile(InductorTestCase):
             s3.synchronize()
             return result
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -842,23 +827,23 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            e_start = _TEST_DEVICE_MODULE.Event()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e_start = torch.cuda.Event()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             # Initial work on default stream
             a = x * 2
             e_start.record()
 
             # Fan out to s1 and s2
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 e_start.wait(s1)
                 b = a + 1
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e_start.wait(s2)
                 c = a + 2
                 e2.record(s2)
@@ -872,7 +857,7 @@ class TestUserStreamCompile(InductorTestCase):
             s2.synchronize()
             return result
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -889,30 +874,30 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            s3 = _TEST_DEVICE_MODULE.Stream()
-            e_start = _TEST_DEVICE_MODULE.Event()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            s3 = torch.cuda.Stream()
+            e_start = torch.cuda.Event()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             # Start on default stream
             a = x + 1
             e_start.record()
 
             # Parallel branches on s1 and s2
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 e_start.wait(s1)
                 b = a * 2
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e_start.wait(s2)
                 c = a * 3
                 e2.record(s2)
 
             # Join on s3
-            with _TEST_DEVICE_MODULE.stream(s3):
+            with torch.cuda.stream(s3):
                 e1.wait(s3)
                 e2.wait(s3)
                 d = b + c
@@ -922,7 +907,7 @@ class TestUserStreamCompile(InductorTestCase):
             s3.synchronize()
             return d
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -940,12 +925,12 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
             result = x
 
             for _ in range(3):
-                with _TEST_DEVICE_MODULE.stream(s):
+                with torch.cuda.stream(s):
                     result = result * 2
                     event.record(s)
                 event.wait()
@@ -953,7 +938,7 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return result
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -971,21 +956,21 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             # These could be fused if on same stream, but should NOT be fused
             # since they're on different streams
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 # Multiple pointwise ops that would normally fuse
                 a = x * 2
                 b = a + 1
                 c = b * 3
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 # Another set of pointwise ops
                 d = x * 4
                 e = d + 2
@@ -996,7 +981,7 @@ class TestUserStreamCompile(InductorTestCase):
             e2.wait()
             return c + f
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -1014,8 +999,8 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
             # Work on default stream
             a = x * 2
@@ -1023,7 +1008,7 @@ class TestUserStreamCompile(InductorTestCase):
             event.record()
 
             # Work on side stream - depends on default stream
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 event.wait()
                 c = b * 3  # depends on b from default stream
                 d = c + 1
@@ -1031,7 +1016,7 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return d
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -1047,9 +1032,9 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 # Multiple pointwise ops on same stream - should fuse
                 a = x * 2
                 b = a + 1
@@ -1059,7 +1044,7 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return d
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -1076,20 +1061,20 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x + 1
             e = s1.record_event()
             s2.wait_event(e)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = a * 2
             s1.synchronize()
             s2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -1107,23 +1092,23 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, y, z, w):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
 
             # Independent pointwise ops on different streams at the same
             # topological level — combo kernels must not merge them.
             a = x + y
             event.record()
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 event.wait()
                 b = z + w
             s.synchronize()
             return a, b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        y = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        z = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        w = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
+        y = torch.randn(1024, device="cuda")
+        z = torch.randn(1024, device="cuda")
+        w = torch.randn(1024, device="cuda")
 
         expected = fn(x, y, z, w)
         compiled_fn = torch.compile(fn)
@@ -1141,9 +1126,9 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, y):
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 # Two independent pointwise ops on the same stream — eligible
                 # for combo kernel fusion.
                 a = x * 2
@@ -1152,8 +1137,8 @@ class TestUserStreamCompile(InductorTestCase):
             s.synchronize()
             return a + b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        y = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
+        y = torch.randn(1024, device="cuda")
 
         expected = fn(x, y)
         compiled_fn = torch.compile(fn)
@@ -1171,21 +1156,21 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = x + 1
                 b = a[:, ::2]  # non-contiguous slice
             e = s1.record_event()
             s2.wait_event(e)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 c = b.contiguous()
                 d = c + 1
             s2.synchronize()
             return d
 
-        x = torch.randn(64, 64, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(64, 64, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -1231,18 +1216,18 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            with _TEST_DEVICE_MODULE.stream(s1):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            with torch.cuda.stream(s1):
                 a = x + 1
             e = s1.record_event()
             s2.wait_event(e)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = a + 2
             s2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x)
@@ -1259,18 +1244,18 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            with _TEST_DEVICE_MODULE.stream(s1):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            with torch.cuda.stream(s1):
                 a = x + 1
             e = s1.record_event()
             s2.wait_event(e)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = a * 2
             s2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x)
@@ -1284,14 +1269,14 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
-            with _TEST_DEVICE_MODULE.stream(s):
+            s = torch.cuda.Stream()
+            with torch.cuda.stream(s):
                 a = x + 1
             s.synchronize()
             b = a * 2
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x)
@@ -1303,17 +1288,17 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            with _TEST_DEVICE_MODULE.stream(s1):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            with torch.cuda.stream(s1):
                 a = x + 1
             s2.wait_stream(s1)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = a * 2
             s2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x)
@@ -1325,17 +1310,17 @@ class TestUserStreamCompile(InductorTestCase):
         """wait_stream must not be reordered before the work it synchronizes."""
         from torch._inductor.utils import run_and_get_code
 
-        side = _TEST_DEVICE_MODULE.Stream()
+        side = torch.cuda.Stream()
 
         def fn(x):
             a = x * 2
-            side.wait_stream(_TEST_DEVICE_MODULE.current_stream())
-            with _TEST_DEVICE_MODULE.stream(side):
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
                 b = a + 1
-            _TEST_DEVICE_MODULE.current_stream().wait_stream(side)
+            torch.cuda.current_stream().wait_stream(side)
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x)
@@ -1361,18 +1346,18 @@ class TestUserStreamCompile(InductorTestCase):
         """wait_stream must order subsequent waiting-stream work even with independent inputs."""
         from torch._inductor.utils import run_and_get_code
 
-        side = _TEST_DEVICE_MODULE.Stream()
+        side = torch.cuda.Stream()
 
         def fn(x, y):
             a = x * 2
-            side.wait_stream(_TEST_DEVICE_MODULE.current_stream())
-            with _TEST_DEVICE_MODULE.stream(side):
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
                 b = y + 1
-            _TEST_DEVICE_MODULE.current_stream().wait_stream(side)
+            torch.cuda.current_stream().wait_stream(side)
             return a + b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
-        y = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
+        y = torch.randn(1024, device="cuda")
         expected = fn(x, y)
         compiled_fn = torch.compile(fn)
         result, (code,) = run_and_get_code(compiled_fn, x, y)
@@ -1412,14 +1397,14 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
-            s = _TEST_DEVICE_MODULE.Stream()
+            s = torch.cuda.Stream()
             a = x * 2
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 b = x * 3
             s.synchronize()
             return a + b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         expected = fn(x)
         counter = CompileCounterWithBackend("inductor")
         compiled_fn = torch.compile(fn, backend=counter)
@@ -1450,7 +1435,7 @@ class GraphModule(torch.nn.Module):
         self.assertGreaterEqual(wrapper_body.count("triton_kernel.run("), 2)
         (
             FileCheck()
-            .check(f"default_stream = torch.{_TEST_DEVICE_TYPE}.current_stream()")
+            .check("default_stream = torch.cuda.current_stream()")
             .check("stream1 = _get_stream_by_index(1)")
             .check("with stream1:")
             .check("triton_kernel.run(")
@@ -1464,19 +1449,19 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2):
-            s = _TEST_DEVICE_MODULE.Stream()
-            event = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            event = torch.cuda.Event()
             a = x @ w1
             event.record()
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 event.wait()
                 b = a @ w2
             s.synchronize()
             return b
 
-        x = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w1 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w2 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(32, 32, device="cuda")
+        w1 = torch.randn(32, 32, device="cuda")
+        w2 = torch.randn(32, 32, device="cuda")
         expected = fn(x, w1, w2)
         counter = CompileCounterWithBackend("inductor")
         compiled_fn = torch.compile(fn, backend=counter)
@@ -1531,19 +1516,19 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2, w3):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            s3 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
-            with _TEST_DEVICE_MODULE.stream(s1):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            s3 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            with torch.cuda.stream(s1):
                 a = x @ w1
                 e1.record(s1)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e1.wait(s2)
                 b = a @ w2
                 e2.record(s2)
-            with _TEST_DEVICE_MODULE.stream(s3):
+            with torch.cuda.stream(s3):
                 e2.wait(s3)
                 c = b @ w3
             s1.synchronize()
@@ -1551,10 +1536,10 @@ class GraphModule(torch.nn.Module):
             s3.synchronize()
             return c
 
-        x = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w1 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w2 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w3 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(32, 32, device="cuda")
+        w1 = torch.randn(32, 32, device="cuda")
+        w2 = torch.randn(32, 32, device="cuda")
+        w3 = torch.randn(32, 32, device="cuda")
         expected = fn(x, w1, w2, w3)
         counter = CompileCounterWithBackend("inductor")
         compiled_fn = torch.compile(fn, backend=counter)
@@ -1632,14 +1617,14 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
-            with _TEST_DEVICE_MODULE.stream(s1):
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            with torch.cuda.stream(s1):
                 a = x @ w1
                 e1.record(s1)
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 b = x @ w2
                 e2.record(s2)
             e1.wait()
@@ -1649,9 +1634,9 @@ class GraphModule(torch.nn.Module):
             s2.synchronize()
             return c
 
-        x = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w1 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
-        w2 = torch.randn(32, 32, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(32, 32, device="cuda")
+        w1 = torch.randn(32, 32, device="cuda")
+        w2 = torch.randn(32, 32, device="cuda")
         expected = fn(x, w1, w2)
         counter = CompileCounterWithBackend("inductor")
         compiled_fn = torch.compile(fn, backend=counter)
@@ -1716,7 +1701,7 @@ class GraphModule(torch.nn.Module):
         )
 
 
-@requires_accelerator_streams
+@unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestStreamOrderingStress(InductorTestCase):
     """Stress tests verifying that interleaved event record/wait ops
@@ -1735,7 +1720,7 @@ class TestStreamOrderingStress(InductorTestCase):
             actual = compiled_fn(*args)
             # Full device sync as a safety net to ensure all stream work
             # is visible before comparing results.
-            _TEST_DEVICE_MODULE.synchronize()
+            torch.cuda.synchronize()
             if not isinstance(expected, (tuple, list)):
                 expected, actual = [expected], [actual]
             for e, a in zip(expected, actual):
@@ -1760,24 +1745,22 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s = _TEST_DEVICE_MODULE.Stream()
-            e = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            e = torch.cuda.Event()
 
             # Heavy producer on default stream — takes real GPU time
             a = TestStreamOrderingStress._heavy_matmul_chain(x, w)
             e.record()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 e.wait()  # removing this would cause a race
                 b = a + 1
 
             s.synchronize()
             return b
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = (
-            torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
-        )  # use scaled identity for stability
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9  # use scaled identity for stability
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1788,21 +1771,21 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 a = TestStreamOrderingStress._heavy_matmul_chain(x, w)
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e1.wait(s2)
                 b = TestStreamOrderingStress._heavy_matmul_chain(a, w)
                 e2.record(s2)
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 e2.wait(s1)
                 c = b + a
 
@@ -1810,8 +1793,8 @@ class TestStreamOrderingStress(InductorTestCase):
             s2.synchronize()
             return c
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1822,29 +1805,29 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            s3 = _TEST_DEVICE_MODULE.Stream()
-            e = _TEST_DEVICE_MODULE.Event()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
-            e3 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            s3 = torch.cuda.Stream()
+            e = torch.cuda.Event()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
+            e3 = torch.cuda.Event()
 
             # Slow producer
             a = TestStreamOrderingStress._heavy_matmul_chain(x, w)
             e.record()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 e.wait()
                 r1 = a * 2
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e.wait()
                 r2 = a * 3
                 e2.record(s2)
 
-            with _TEST_DEVICE_MODULE.stream(s3):
+            with torch.cuda.stream(s3):
                 e.wait()
                 r3 = a * 4
                 e3.record(s3)
@@ -1859,8 +1842,8 @@ class TestStreamOrderingStress(InductorTestCase):
             s3.synchronize()
             return result
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1871,23 +1854,23 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s1 = _TEST_DEVICE_MODULE.Stream()
-            s2 = _TEST_DEVICE_MODULE.Stream()
-            e_fork = _TEST_DEVICE_MODULE.Event()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            e_fork = torch.cuda.Event()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             base = x @ w
             e_fork.record()
 
-            with _TEST_DEVICE_MODULE.stream(s1):
+            with torch.cuda.stream(s1):
                 e_fork.wait()
                 branch1 = TestStreamOrderingStress._heavy_matmul_chain(
                     torch.relu(base), w
                 )
                 e1.record(s1)
 
-            with _TEST_DEVICE_MODULE.stream(s2):
+            with torch.cuda.stream(s2):
                 e_fork.wait()
                 branch2 = TestStreamOrderingStress._heavy_matmul_chain(
                     torch.sigmoid(base), w
@@ -1902,8 +1885,8 @@ class TestStreamOrderingStress(InductorTestCase):
             s2.synchronize()
             return result
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.5
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.5
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1914,24 +1897,24 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            streams = [_TEST_DEVICE_MODULE.Stream() for _ in range(4)]
-            events = [_TEST_DEVICE_MODULE.Event() for _ in range(3)]
+            streams = [torch.cuda.Stream() for _ in range(4)]
+            events = [torch.cuda.Event() for _ in range(3)]
 
-            with _TEST_DEVICE_MODULE.stream(streams[0]):
+            with torch.cuda.stream(streams[0]):
                 h = TestStreamOrderingStress._heavy_matmul_chain(x, w, depth=4)
                 events[0].record(streams[0])
 
-            with _TEST_DEVICE_MODULE.stream(streams[1]):
+            with torch.cuda.stream(streams[1]):
                 events[0].wait(streams[1])
                 h = TestStreamOrderingStress._heavy_matmul_chain(h, w, depth=4)
                 events[1].record(streams[1])
 
-            with _TEST_DEVICE_MODULE.stream(streams[2]):
+            with torch.cuda.stream(streams[2]):
                 events[1].wait(streams[2])
                 h = TestStreamOrderingStress._heavy_matmul_chain(h, w, depth=4)
                 events[2].record(streams[2])
 
-            with _TEST_DEVICE_MODULE.stream(streams[3]):
+            with torch.cuda.stream(streams[3]):
                 events[2].wait(streams[3])
                 h = h + x  # quick consumer — races if wait is missing
 
@@ -1939,8 +1922,8 @@ class TestStreamOrderingStress(InductorTestCase):
                 s.synchronize()
             return h
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1950,14 +1933,14 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s = _TEST_DEVICE_MODULE.Stream()
-            e1 = _TEST_DEVICE_MODULE.Event()
-            e2 = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            e1 = torch.cuda.Event()
+            e2 = torch.cuda.Event()
 
             a = TestStreamOrderingStress._heavy_matmul_chain(x, w)
             e1.record()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 e1.wait()
                 b = TestStreamOrderingStress._heavy_matmul_chain(a, w)
                 e2.record(s)
@@ -1968,8 +1951,8 @@ class TestStreamOrderingStress(InductorTestCase):
             s.synchronize()
             return c
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9
         self._check_compiled_matches_eager(fn, x, w)
 
     # ------------------------------------------------------------------
@@ -1981,10 +1964,10 @@ class TestStreamOrderingStress(InductorTestCase):
         N = self.N
 
         def fn(x, w):
-            s = _TEST_DEVICE_MODULE.Stream()
-            e = _TEST_DEVICE_MODULE.Event()
+            s = torch.cuda.Stream()
+            e = torch.cuda.Event()
 
-            with _TEST_DEVICE_MODULE.stream(s):
+            with torch.cuda.stream(s):
                 # Heavy matmul chain produces data on user stream
                 a = TestStreamOrderingStress._heavy_matmul_chain(x, w)
                 # Triton pointwise on the same user stream — without fix
@@ -1996,12 +1979,12 @@ class TestStreamOrderingStress(InductorTestCase):
             s.synchronize()
             return b
 
-        x = torch.randn(N, N, device=_TEST_DEVICE_TYPE)
-        w = torch.eye(N, device=_TEST_DEVICE_TYPE) * 0.9
+        x = torch.randn(N, N, device="cuda")
+        w = torch.eye(N, device="cuda") * 0.9
         self._check_compiled_matches_eager(fn, x, w)
 
 
-@requires_accelerator_streams
+@unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestGenericStreamCompile(InductorTestCase):
     """Tests for torch.compile with device-agnostic torch.Stream API."""
@@ -2011,7 +1994,7 @@ class TestGenericStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         # Create stream outside compiled function
-        stream = torch.Stream(_TEST_DEVICE_TYPE)
+        stream = torch.Stream("cuda")
 
         def fn(x):
             with stream:
@@ -2021,7 +2004,7 @@ class TestGenericStreamCompile(InductorTestCase):
             stream.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -2037,9 +2020,9 @@ class TestGenericStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         # Create stream and event outside compiled function
-        stream = torch.Stream(_TEST_DEVICE_TYPE)
-        event = torch.Event(_TEST_DEVICE_TYPE)
-        device_stream = _TEST_DEVICE_MODULE.Stream(
+        stream = torch.Stream("cuda")
+        event = torch.Event("cuda")
+        cuda_stream = torch.cuda.Stream(
             stream_id=stream.stream_id,
             device_index=stream.device_index,
             device_type=stream.device_type,
@@ -2050,14 +2033,14 @@ class TestGenericStreamCompile(InductorTestCase):
             a = x * 2
             event.record()
 
-            with _TEST_DEVICE_MODULE.stream(device_stream):
+            with torch.cuda.stream(cuda_stream):
                 event.wait()
                 b = a + 1
 
-            device_stream.synchronize()
+            cuda_stream.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -2073,34 +2056,34 @@ class TestGenericStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         # Create streams and event outside compiled function
-        stream1 = torch.Stream(_TEST_DEVICE_TYPE)
-        stream2 = torch.Stream(_TEST_DEVICE_TYPE)
-        event = torch.Event(_TEST_DEVICE_TYPE)
-        device_stream1 = _TEST_DEVICE_MODULE.Stream(
+        stream1 = torch.Stream("cuda")
+        stream2 = torch.Stream("cuda")
+        event = torch.Event("cuda")
+        cuda_stream1 = torch.cuda.Stream(
             stream_id=stream1.stream_id,
             device_index=stream1.device_index,
             device_type=stream1.device_type,
         )
-        device_stream2 = _TEST_DEVICE_MODULE.Stream(
+        cuda_stream2 = torch.cuda.Stream(
             stream_id=stream2.stream_id,
             device_index=stream2.device_index,
             device_type=stream2.device_type,
         )
 
         def fn(x):
-            with _TEST_DEVICE_MODULE.stream(device_stream1):
+            with torch.cuda.stream(cuda_stream1):
                 a = x * 2
                 event.record()
 
-            with _TEST_DEVICE_MODULE.stream(device_stream2):
+            with torch.cuda.stream(cuda_stream2):
                 event.wait()
                 b = a + 1
 
-            device_stream1.synchronize()
-            device_stream2.synchronize()
+            cuda_stream1.synchronize()
+            cuda_stream2.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -2118,27 +2101,27 @@ class TestGenericStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         # Create stream and event outside compiled function
-        stream = torch.Stream(_TEST_DEVICE_TYPE)
-        event = torch.Event(_TEST_DEVICE_TYPE)
-        device_stream = _TEST_DEVICE_MODULE.Stream(
+        stream = torch.Stream("cuda")
+        event = torch.Event("cuda")
+        cuda_stream = torch.cuda.Stream(
             stream_id=stream.stream_id,
             device_index=stream.device_index,
             device_type=stream.device_type,
         )
 
         def fn(x):
-            with _TEST_DEVICE_MODULE.stream(device_stream):
+            with torch.cuda.stream(cuda_stream):
                 a = x * 2
-                # Record the event on the explicit stream.
-                event.record(device_stream)
+                # Record event with explicit stream (using cuda_stream)
+                event.record(cuda_stream)
 
             event.wait()
             b = a + 1
 
-            device_stream.synchronize()
+            cuda_stream.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
 
         expected = fn(x)
         compiled_fn = torch.compile(fn)
@@ -2150,7 +2133,7 @@ class TestGenericStreamCompile(InductorTestCase):
         self.assertIn("record_event", code)
 
 
-@requires_accelerator_streams
+@unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestStreamIdentity(InductorTestCase):
     """Verify that compiled code uses the user's original stream objects."""
@@ -2159,38 +2142,38 @@ class TestStreamIdentity(InductorTestCase):
         """Codegen should retrieve the user's stream via _get_stream_by_index."""
         from torch._inductor.utils import run_and_get_code
 
-        user_stream = _TEST_DEVICE_MODULE.Stream()
+        user_stream = torch.cuda.Stream()
 
         def fn(x):
-            with _TEST_DEVICE_MODULE.stream(user_stream):
+            with torch.cuda.stream(user_stream):
                 return x * 2
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         result, (code,) = run_and_get_code(torch.compile(fn), x)
 
         self.assertEqual(result, fn(x))
         self.assertIn("_get_stream_by_index", code)
-        self.assertNotIn(f"torch.{_TEST_DEVICE_TYPE}.Stream(device=", code)
+        self.assertNotIn("torch.cuda.Stream(device=", code)
 
     def test_multiple_stream_identity(self):
         """Each stream context should retrieve a different user stream object."""
         from torch._inductor.utils import run_and_get_code
 
-        stream_a = _TEST_DEVICE_MODULE.Stream()
-        stream_b = _TEST_DEVICE_MODULE.Stream()
+        stream_a = torch.cuda.Stream()
+        stream_b = torch.cuda.Stream()
 
         def fn(x):
-            event = _TEST_DEVICE_MODULE.Event()
-            with _TEST_DEVICE_MODULE.stream(stream_a):
+            event = torch.cuda.Event()
+            with torch.cuda.stream(stream_a):
                 a = x * 2
                 event.record()
-            with _TEST_DEVICE_MODULE.stream(stream_b):
+            with torch.cuda.stream(stream_b):
                 event.wait()
                 b = a + 1
             stream_b.synchronize()
             return b
 
-        x = torch.randn(1024, device=_TEST_DEVICE_TYPE)
+        x = torch.randn(1024, device="cuda")
         result, (code,) = run_and_get_code(torch.compile(fn), x)
 
         self.assertEqual(result, fn(x))
@@ -2198,7 +2181,7 @@ class TestStreamIdentity(InductorTestCase):
         matches = re.findall(r"_get_stream_by_index\((\d+)\)", code)
         self.assertEqual(len(matches), 2)
         self.assertNotEqual(matches[0], matches[1])
-        self.assertNotIn(f"torch.{_TEST_DEVICE_TYPE}.Stream(device=", code)
+        self.assertNotIn("torch.cuda.Stream(device=", code)
 
 
 @xfailIfNoAcceleratorTriton
@@ -2749,21 +2732,21 @@ instantiate_parametrized_tests(TestAOTIUserStreams)
 instantiate_parametrized_tests(TestStreamCudagraphInteraction)
 
 
-@requires_accelerator_streams
+@unittest.skipIf(not TEST_CUDA, "requires CUDA")
 class TestStreamExternalObjectRestore(InductorTestCase):
     def test_restore_external_objects_before_backward(self):
         """Forward snapshots external object registry, backward restores it."""
         from torch._dynamo.graph_bytecode_inputs import store_user_object_weakrefs
 
         def fn(x):
-            s = torch.Stream(device=_TEST_DEVICE_TYPE)
+            s = torch.Stream(device="cuda")
             with s:
                 return x * 2 + 1
 
         compiled_fn = torch.compile(fn)
-        x = torch.randn(4, 4, device=_TEST_DEVICE_TYPE, requires_grad=True)
+        x = torch.randn(4, 4, device="cuda", requires_grad=True)
         out = compiled_fn(x)
-        store_user_object_weakrefs(_TEST_DEVICE_MODULE.Stream())
+        store_user_object_weakrefs(torch.cuda.Stream())
         out.sum().backward()
         self.assertIsNotNone(x.grad)
         torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
