@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import torch
 import torch._inductor.config as inductor_config
 import torch._inductor.metrics
+from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.testing import CompileCounterWithBackend, normalize_gm
 from torch._inductor.codegen.cuda.device_op_overrides import CUDADeviceOpOverrides
 from torch._inductor.codegen.wrapper import (
@@ -43,17 +44,17 @@ from torch.testing._internal.common_utils import (
 from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 
-_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
-_IS_PRIVATEUSE1 = GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE
-_TEST_DEVICE_TYPE = GPU_TYPE if _IS_PRIVATEUSE1 else "cuda"
+_TEST_DEVICE_TYPE = GPU_TYPE
 _TEST_DEVICE_MODULE = torch.get_device_module(_TEST_DEVICE_TYPE)
-requires_cuda_or_privateuse1 = (
-    unittest.skipUnless(HAS_GPU, "requires PrivateUse1 accelerator")
-    if _IS_PRIVATEUSE1
-    else unittest.skipUnless(TEST_CUDA, "requires CUDA")
+_TEST_DEVICE_INTERFACE = get_interface_for_device(_TEST_DEVICE_TYPE)
+_TEST_DEVICE_EXPOSES_STREAMS = _TEST_DEVICE_INTERFACE.exposes_streams()
+requires_accelerator_streams = unittest.skipUnless(
+    HAS_GPU and _TEST_DEVICE_EXPOSES_STREAMS,
+    "requires accelerator stream support",
 )
-requires_two_cuda_or_privateuse1_devices = unittest.skipIf(
-    not (HAS_GPU if _IS_PRIVATEUSE1 else TEST_CUDA)
+requires_two_accelerator_devices = unittest.skipIf(
+    not HAS_GPU
+    or not _TEST_DEVICE_EXPOSES_STREAMS
     or _TEST_DEVICE_MODULE.device_count() < 2,
     "requires at least two accelerator devices",
 )
@@ -317,7 +318,7 @@ with torch.xpu._DeviceGuard(0):
         self.assertTrue(make_line(1).setup_stream_cache)
         self.assertTrue(make_line(0).setup_stream_cache)
 
-    @requires_cuda_or_privateuse1
+    @requires_accelerator_streams
     def test_generated_code_uses_get_stream_by_index(self):
         """Generated inductor code should use _get_stream_by_index."""
         from torch._inductor.utils import run_and_get_code
@@ -334,7 +335,7 @@ with torch.xpu._DeviceGuard(0):
         torch.testing.assert_close(result, expected)
 
 
-@requires_cuda_or_privateuse1
+@requires_accelerator_streams
 @xfailIfNoAcceleratorTriton
 class TestUserStreamCompile(InductorTestCase):
     """End-to-end tests for torch.compile with user stream contexts."""
@@ -374,7 +375,7 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(_count_generated_stream_contexts(code), 1)
         self.assertIn("synchronize_stream", code)
 
-    @requires_two_cuda_or_privateuse1_devices
+    @requires_two_accelerator_devices
     def test_raw_stream_name_does_not_clobber_user_stream_on_cuda_1(self):
         from torch._inductor.utils import run_and_get_code
 
@@ -1715,7 +1716,7 @@ class GraphModule(torch.nn.Module):
         )
 
 
-@requires_cuda_or_privateuse1
+@requires_accelerator_streams
 @xfailIfNoAcceleratorTriton
 class TestStreamOrderingStress(InductorTestCase):
     """Stress tests verifying that interleaved event record/wait ops
@@ -2000,7 +2001,7 @@ class TestStreamOrderingStress(InductorTestCase):
         self._check_compiled_matches_eager(fn, x, w)
 
 
-@requires_cuda_or_privateuse1
+@requires_accelerator_streams
 @xfailIfNoAcceleratorTriton
 class TestGenericStreamCompile(InductorTestCase):
     """Tests for torch.compile with device-agnostic torch.Stream API."""
@@ -2149,7 +2150,7 @@ class TestGenericStreamCompile(InductorTestCase):
         self.assertIn("record_event", code)
 
 
-@requires_cuda_or_privateuse1
+@requires_accelerator_streams
 @xfailIfNoAcceleratorTriton
 class TestStreamIdentity(InductorTestCase):
     """Verify that compiled code uses the user's original stream objects."""
@@ -2748,7 +2749,7 @@ instantiate_parametrized_tests(TestAOTIUserStreams)
 instantiate_parametrized_tests(TestStreamCudagraphInteraction)
 
 
-@requires_cuda_or_privateuse1
+@requires_accelerator_streams
 class TestStreamExternalObjectRestore(InductorTestCase):
     def test_restore_external_objects_before_backward(self):
         """Forward snapshots external object registry, backward restores it."""
