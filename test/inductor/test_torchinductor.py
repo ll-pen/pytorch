@@ -179,41 +179,40 @@ if TEST_WITH_ROCM:
     os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC"] = "1"
 
 aten = torch.ops.aten
-_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
 
 
 def _get_aoti_eager_device_and_dispatch_key(device_type: str) -> tuple[str, str]:
-    if device_type.lower() == "cuda":
-        return "cuda", "CUDA"
-    if device_type == _PRIVATEUSE1_DEVICE_TYPE:
-        return device_type, torch._C._dispatch_key_for_device(device_type)
-    return "cpu", "CPU"
+    if device_type.lower() == "cpu":
+        return "cpu", "CPU"
+    return device_type, torch._C._dispatch_key_for_device(device_type)
+
+
+def _is_triton_accelerator(device_type: str) -> bool:
+    try:
+        device_interface = get_interface_for_device(device_type)
+    except NotImplementedError:
+        return False
+    return device_interface.is_gpu() and device_interface.is_triton_capable()
 
 
 def _should_run_sdpa_test(platform_support: bool) -> bool:
-    return GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE or platform_support
+    return platform_support or (GPU_TYPE != "cuda" and _is_triton_accelerator(GPU_TYPE))
 
 
-def _privateuse1_supports_bf16() -> bool:
-    if GPU_TYPE != _PRIVATEUSE1_DEVICE_TYPE:
-        return False
-    device_module = getattr(torch, _PRIVATEUSE1_DEVICE_TYPE, None)
+def _accelerator_supports_bf16() -> bool:
+    device_module = torch.get_device_module(GPU_TYPE)
     is_bf16_supported = getattr(device_module, "is_bf16_supported", None)
-    return is_bf16_supported is not None and is_bf16_supported()
+    if is_bf16_supported is None:
+        return False
+    if GPU_TYPE == "cuda":
+        return is_bf16_supported(including_emulation=False)
+    return is_bf16_supported()
 
 
 requires_multigpu = functools.partial(
     unittest.skipIf, not HAS_MULTIGPU, f"requires multiple {GPU_TYPE} devices"
 )
 requires_cuda = unittest.skipUnless(torch.cuda.is_available(), "requires cuda")
-requires_cuda_or_privateuse1 = (
-    requires_gpu() if GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE else requires_cuda
-)
-requires_cuda_or_privateuse1_and_triton = (
-    requires_gpu_and_triton
-    if GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE
-    else requires_cuda_and_triton
-)
 skip_if_x86_mac = functools.partial(
     unittest.skipIf, IS_MACOS and IS_X86, "Does not work on x86 Mac"
 )
@@ -225,6 +224,13 @@ ids = set()
 f32 = torch.float32
 i64 = torch.int64
 i32 = torch.int32
+
+
+def _register_current_accelerator_impl(lib, op_name, fn):
+    dispatch_key = torch._C._dispatch_key_for_device(GPU_TYPE)
+    if dispatch_key not in ("CUDA", "XPU", "MPS"):
+        lib.impl(op_name, fn, dispatch_key)
+
 
 test_dtypes = [
     torch.float32,
@@ -249,7 +255,7 @@ if (
     SM80OrLater
     or MACOS_VERSION >= 14.0
     or GPU_TYPE == "xpu"
-    or _privateuse1_supports_bf16()
+    or _accelerator_supports_bf16()
 ):
     test_dtypes.append(torch.bfloat16)
 
@@ -301,7 +307,7 @@ def define_custom_op_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        libtest.impl(id_, fn, "PrivateUse1")
+        _register_current_accelerator_impl(libtest, id_, fn)
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -317,7 +323,7 @@ def define_custom_op_2_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        libtest.impl(id_, fn, "PrivateUse1")
+        _register_current_accelerator_impl(libtest, id_, fn)
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -331,7 +337,7 @@ def define_custom_op_3_for_test(id_, fn, fn_meta, tags=()):
         libtest.impl(id_, fn, "CUDA")
         libtest.impl(id_, fn, "XPU")
         libtest.impl(id_, fn, "MPS")
-        libtest.impl(id_, fn, "PrivateUse1")
+        _register_current_accelerator_impl(libtest, id_, fn)
         libtest.impl(id_, fn_meta, "Meta")
         ids.add(id_)
 
@@ -2578,7 +2584,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def sum_combine(a, b):
@@ -2607,7 +2613,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_compiled(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         from torch._higher_order_ops.associative_scan import associative_scan
@@ -2642,7 +2648,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_multi_input(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def argmax_combine(a, b):
@@ -2669,7 +2675,7 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_would_split(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             raise unittest.SkipTest("associative_scan requires a supported accelerator")
 
         def combine_linear_recurrence(left, right):
@@ -3148,7 +3154,7 @@ class CommonTemplate:
 
     @skip_if_gpu_halide
     def test_cumprod_backward_split_scan_reduction_fusion(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             raise unittest.SkipTest("split scan requires a supported accelerator")
 
         seq_len = 8193
@@ -7186,8 +7192,8 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(implicit_fallbacks=True)
     def test_no_grad_embedding_renorm_negative_indices(self):
-        if self.device not in ("cuda", _PRIVATEUSE1_DEVICE_TYPE):
-            raise unittest.SkipTest("requires CUDA or PrivateUse1")
+        if not _is_triton_accelerator(self.device):
+            raise unittest.SkipTest("requires a Triton accelerator")
 
         def fn(weight, indices):
             return torch.ops.aten._no_grad_embedding_renorm_(
@@ -7375,8 +7381,8 @@ for dtype in (torch.int32, torch.int64):
             assertGeneratedKernelCountEqual(self, 1)
 
     def test_layer_norm_rejects_complex_inputs(self):
-        if self.device not in ("cpu", "cuda", _PRIVATEUSE1_DEVICE_TYPE):
-            raise unittest.SkipTest("Only validated on CPU/CUDA/PrivateUse1")
+        if self.device != "cpu" and not _is_triton_accelerator(self.device):
+            raise unittest.SkipTest("requires CPU or a Triton accelerator")
 
         m = torch.nn.LayerNorm(10).to(self.device)
         x = torch.randn(1, 1, 10, device=self.device, dtype=torch.complex64)
@@ -7955,11 +7961,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_infinitely_differentiable_gelu_backward_bfloat16(self):
-        if self.device not in ("cuda", _PRIVATEUSE1_DEVICE_TYPE):
-            raise unittest.SkipTest("requires CUDA or PrivateUse1")
-        if self.device == "cuda" and not SM80OrLater:
-            raise unittest.SkipTest("uses bfloat16 which requires SM >= 80")
-        if self.device == _PRIVATEUSE1_DEVICE_TYPE and not _privateuse1_supports_bf16():
+        if not _is_triton_accelerator(self.device):
+            raise unittest.SkipTest("requires a Triton accelerator")
+        if not _accelerator_supports_bf16():
             raise unittest.SkipTest("requires bfloat16 support")
 
         def fn(grad, self):
@@ -8854,8 +8858,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 c_fn(x)
 
     def test_convolution_errors_on_input_weight_dtype_mismatch(self):
-        if self.device not in ("cuda", _PRIVATEUSE1_DEVICE_TYPE):
-            raise unittest.SkipTest("requires CUDA or PrivateUse1")
+        if not _is_triton_accelerator(self.device):
+            raise unittest.SkipTest("requires a Triton accelerator")
 
         def fn(x):
             return torch.nn.functional.conv2d(x, weight, bias=None)
@@ -9694,7 +9698,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_grid_sampler_expand_preserves_view(self):
-        if self.device not in ("cuda", "xpu", _PRIVATEUSE1_DEVICE_TYPE):
+        if not _is_triton_accelerator(self.device):
             self.skipTest("requires a supported accelerator")
 
         torch.manual_seed(0)
@@ -16999,7 +17003,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             with self.assertRaisesRegex(RuntimeError, "Output size is too small"):
                 _ = torch.compile(model)(inputs)
 
-    @requires_cuda_or_privateuse1
+    @requires_gpu()
     def test_conv_transpose_zero_size_output(self):
         # Accelerators can support zero-sized spatial outputs for conv_transpose
         # by short-circuiting before backend libraries see empty tensor descriptors.
@@ -18456,7 +18460,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         FileCheck().check_regex(r"tl\.store\(.*xmask\)").run(code)
 
     @xfail_if_triton_cpu
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_gpu_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_fma_bitwise_equal(self):
         """Test that addcmul with FMA lowering produces bitwise equal results to eager."""
@@ -18490,7 +18494,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(eager_result2, compiled_result2, atol=atol, rtol=rtol)
 
     @xfail_if_triton_cpu
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_gpu_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_fma_uses_fma_instruction(self):
         """Test that addcmul generates code using FMA instruction."""
