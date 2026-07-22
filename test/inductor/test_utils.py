@@ -302,6 +302,7 @@ class TestUtils(TestCase):
             self.assertEqual(flops, expected)
 
     @xfailIfNoAcceleratorTriton
+    @unittest.skipIf(not torch.cuda.is_available(), "skip if no device")
     @dtypes(torch.float16, torch.bfloat16, torch.float32)
     def test_get_device_tflops(self, dtype):
         ret = get_device_tflops(dtype)
