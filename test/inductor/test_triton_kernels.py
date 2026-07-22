@@ -54,7 +54,6 @@ from torch.testing._internal.logging_utils import log_settings, logs_to_string
 
 # Defines all the kernels for tests
 from torch.testing._internal.triton_utils import *  # noqa: F403
-from torch.testing._internal.triton_utils import requires_cuda_and_triton
 from torch.utils._triton import (
     has_triton_experimental_host_tma,
     has_triton_package,
@@ -62,11 +61,9 @@ from torch.utils._triton import (
 )
 
 
-_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
-requires_cuda_or_privateuse1_and_triton = (
-    unittest.skipUnless(HAS_GPU_AND_TRITON, "requires PrivateUse1 and Triton")
-    if GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE
-    else requires_cuda_and_triton
+requires_user_defined_triton_fusion = unittest.skipUnless(
+    HAS_GPU_AND_TRITON and GPU_TYPE != "xpu",
+    "requires a supported GPU Triton backend",
 )
 
 
@@ -6043,7 +6040,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
                 "del", num_deallocs, exactly=True
             ).run(code_str)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_relu_epilogue(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6071,7 +6068,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_sigmoid_epilogue(self):
         @triton.jit
         def add_kernel(in_ptr0, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6097,7 +6094,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=1)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_with_unused_buffer(self):
         @triton.jit
         def kernel_unused_tensor(
@@ -6124,7 +6121,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a))
         self.check_code(code[0], num_kernels=1, num_allocs=2, num_deallocs=2)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_with_ordering_constraints(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6152,7 +6149,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b))
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_cache(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6180,7 +6177,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b))
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_custom_kernel_with_linebreaks(self):
         # we do AST manipulation / string manipulation of the kernel source code
         # so we wanna make sure to correctly handle edge cases with tricky line breaks
@@ -6219,7 +6216,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=1)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_read_write_tensors(self):
         # cannot epilogue-fuse this one because the kernel reads from `out_ptr` before writing to it
         @triton.jit
@@ -6249,7 +6246,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         # no fusion, so 2 kernels: add_kernel, relu
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_multiple_stores(self):
         # cannot epilogue-fuse this one because the kernel stores twice (once directly and once indirectly via another triton func)
         """
@@ -6287,7 +6284,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         # no fusion, so 2 kernels: add_kernel, relu
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_non_empty_outputs(self):
         # cannot epilogue-fuse this one because the kernel writes to buffer initialized with non-UB values
         @triton.jit
@@ -6317,7 +6314,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         # no fusion, so 3 kernels: ones, add_kernel, relu
         self.check_code(code[0], num_kernels=3, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_concat_outputs(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6352,7 +6349,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         # no fusion, so 3 kernels: concat, add_kernel, relu
         self.check_code(code[0], num_kernels=3, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_multiple_reads_on_mutated_tensor(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6381,7 +6378,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         # two kernels: user defined `add_kernel`, and the generated one for both sigmoid and relu
         self.check_code(code[0], num_kernels=2, num_allocs=3, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_atomic_store(self):
         # on ROCm we skip this because `tl.atomic_xchg` fails to compile in ROCm
         if torch.version.hip is not None:
@@ -6413,7 +6410,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_indexing_var_usage(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6442,7 +6439,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b), atol=0.05, rtol=0.05)
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_non_unary_epilogue(self):
         @triton.jit
         def add_kernel(a_ptr, b_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr):
@@ -6468,7 +6465,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b, c))
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=4)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_fusion_cast_epilogue(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6492,7 +6489,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.assertEqual(out, fn(a, b))
         self.check_code(code[0], num_kernels=1, num_allocs=1, num_deallocs=2)
 
-    @requires_cuda_or_privateuse1_and_triton
+    @requires_user_defined_triton_fusion
     def test_no_fusion_for_out_of_place_epilogue(self):
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -6516,7 +6513,7 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         self.check_code(code[0], num_kernels=2, num_allocs=2, num_deallocs=3)
 
 
-if HAS_CUDA_AND_TRITON or (GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE and HAS_GPU_AND_TRITON):
+if HAS_GPU_AND_TRITON and GPU_TYPE != "xpu":
 
     @triton.jit
     def custom_store(ptr, val, mask):
