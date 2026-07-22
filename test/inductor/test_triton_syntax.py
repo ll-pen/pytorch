@@ -13,15 +13,13 @@ class TestTritonSyntacticallyValid(TestCase):
 
         import torch.nn as nn
 
-        supports_bf16 = False
-        if GPU_TYPE in ("cuda", torch._C._get_privateuse1_backend_name()):
-            device_module = torch.get_device_module(GPU_TYPE)
-            if GPU_TYPE == "cuda":
-                supports_bf16 = device_module.is_bf16_supported(
-                    including_emulation=False
-                )
-            elif hasattr(device_module, "is_bf16_supported"):
-                supports_bf16 = device_module.is_bf16_supported()
+        device_module = torch.get_device_module(GPU_TYPE)
+        is_bf16_supported = getattr(device_module, "is_bf16_supported", None)
+        supports_bf16 = is_bf16_supported is not None and (
+            is_bf16_supported(including_emulation=False)
+            if GPU_TYPE == "cuda"
+            else is_bf16_supported()
+        )
 
         def newtonschulz5(G, steps: int, eps=1e-7):
             assert len(G.shape) == 2  # noqa: S101
