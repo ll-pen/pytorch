@@ -38,8 +38,11 @@ from torch._functorch.aot_autograd import (
 )
 from torch._guards import tracing, TracingContext
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.testing._internal.common_device_type import (
+    instantiate_device_type_tests,
+    onlyAccelerator,
+)
 from torch.testing._internal.common_utils import (
-    requires_cuda,
     run_tests,
     skipIfCrossRef,
     skipIfTorchDynamo,
@@ -829,8 +832,7 @@ class inner_f(torch.nn.Module):
 ('call_function', 't_3', {'pp_stage': 0})""",
             )
 
-    @requires_cuda
-    def test_preserve_annotate_flex_attention(self):
+    def _test_preserve_annotate_flex_attention(self, device):
         def score_mod(score, b, h, m, n):
             return score
 
@@ -845,8 +847,6 @@ class inner_f(torch.nn.Module):
         b = 24
         batch_size = 2
         seqlen = a * b
-        device = "cuda"
-
         # Create seq_idx tensor - maps each position to a document/sequence ID
         # Example: Split sequence into 2 documents for each batch
         # First half (0:384) belongs to document 0, second half (384:768) to document 1
@@ -1342,6 +1342,19 @@ class inner_f(torch.nn.Module):
 ('call_function', 'invoke_subgraph_1', {'call_id': 1, 'mod_name': 'my_mod'})
 ('call_function', 'getitem_1', {'mod_name': 'my_mod'})""",
         )
+
+
+class TestAOTJointWithDescriptorsAccelerator(TestCase):
+    @onlyAccelerator
+    def test_preserve_annotate_flex_attention(self, device):
+        TestAOTJointWithDescriptors._test_preserve_annotate_flex_attention(self, device)
+
+
+instantiate_device_type_tests(
+    TestAOTJointWithDescriptorsAccelerator,
+    globals(),
+    only_for=("cpu", "cuda"),
+)
 
 
 if __name__ == "__main__":
