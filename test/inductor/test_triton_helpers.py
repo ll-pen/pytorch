@@ -19,10 +19,11 @@ from torch._inductor.runtime.triton_helpers import (
     select_one,
 )
 from torch._inductor.test_case import run_tests, TestCase
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, requires_gpu
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.utils._triton import has_triton
 
 
-if HAS_GPU:
+if has_triton():
     import triton  # @manual
     from triton import language as tl
 
@@ -117,10 +118,9 @@ if HAS_GPU:
 class ExclusiveScanDecoupledLookback64Test(TestCase):
     """Test cases for exclusive_scan_decoupled_lookback_64 dtype fix."""
 
-    @requires_gpu()
-    def test_flag_2_branch_with_int64_index(self) -> None:
+    def test_flag_2_branch_with_int64_index(self, device) -> None:
         """Test `if flag == 2` branch with int64 index."""
-        device = torch.device(GPU_TYPE)
+        device = torch.device(device)
 
         # Scratch memory layout per block: [flag, partial_aggregate, inclusive_prefix]
         # Block 0: flag=2 (inclusive prefix ready), inclusive_prefix=10.0
@@ -141,10 +141,9 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
         expected = torch.tensor([10.0], dtype=torch.float64, device=device)
         torch.testing.assert_close(result, expected)
 
-    @requires_gpu()
-    def test_flag_2_branch_with_int32_index(self) -> None:
+    def test_flag_2_branch_with_int32_index(self, device) -> None:
         """Test `if flag == 2` branch with int32 index."""
-        device = torch.device(GPU_TYPE)
+        device = torch.device(device)
 
         # Scratch memory layout per block: [flag, partial_aggregate, inclusive_prefix]
         # Block 0: flag=2 (inclusive prefix ready), inclusive_prefix=10.0
@@ -175,8 +174,8 @@ class SelectOneTest(TestCase):
     bitcast from int32 to a 16-bit dtype fails with a size mismatch error.
     """
 
-    def _run_select_one(self, dtype: torch.dtype) -> None:
-        device = torch.device(GPU_TYPE)
+    def _run_select_one(self, dtype: torch.dtype, device: str) -> None:
+        device = torch.device(device)
         BLOCK_SIZE = 4
 
         # Create input tensor and a one-hot mask selecting the element at index 2
@@ -189,32 +188,28 @@ class SelectOneTest(TestCase):
         expected = torch.tensor([3.0], dtype=dtype, device=device)
         torch.testing.assert_close(result, expected)
 
-    @requires_gpu()
-    def test_select_one_bfloat16(self) -> None:
+    def test_select_one_bfloat16(self, device) -> None:
         """Test select_one with bfloat16 (16-bit) — triggers the bitcast fix."""
-        self._run_select_one(torch.bfloat16)
+        self._run_select_one(torch.bfloat16, device)
 
-    @requires_gpu()
-    def test_select_one_float16(self) -> None:
+    def test_select_one_float16(self, device) -> None:
         """Test select_one with float16 (16-bit) — triggers the bitcast fix."""
-        self._run_select_one(torch.float16)
+        self._run_select_one(torch.float16, device)
 
-    @requires_gpu()
-    def test_select_one_float32(self) -> None:
+    def test_select_one_float32(self, device) -> None:
         """Test select_one with float32 (32-bit) — baseline that always worked."""
-        self._run_select_one(torch.float32)
+        self._run_select_one(torch.float32, device)
 
-    @requires_gpu()
-    def test_select_one_float64(self) -> None:
+    def test_select_one_float64(self, device) -> None:
         """Test select_one with float64 (64-bit) — baseline that always worked."""
-        self._run_select_one(torch.float64)
+        self._run_select_one(torch.float64, device)
 
 
 class Random4xTest(TestCase):
     """Test cases for rand4x/randn4x helper packing order."""
 
-    def _run_random_4x_order(self, normal: bool, block_size: int) -> None:
-        device = torch.device(GPU_TYPE)
+    def _run_random_4x_order(self, normal: bool, block_size: int, device: str) -> None:
+        device = torch.device(device)
         helper_result = torch.empty(block_size, dtype=torch.float32, device=device)
         expected_result = torch.empty(block_size, dtype=torch.float32, device=device)
 
@@ -228,32 +223,26 @@ class Random4xTest(TestCase):
 
         torch.testing.assert_close(helper_result, expected_result, atol=0, rtol=0)
 
-    @requires_gpu()
-    def test_rand4x_order(self) -> None:
-        self._run_random_4x_order(normal=False, block_size=16)
+    def test_rand4x_order(self, device) -> None:
+        self._run_random_4x_order(normal=False, block_size=16, device=device)
 
-    @requires_gpu()
-    def test_randn4x_order(self) -> None:
-        self._run_random_4x_order(normal=True, block_size=16)
+    def test_randn4x_order(self, device) -> None:
+        self._run_random_4x_order(normal=True, block_size=16, device=device)
 
-    @requires_gpu()
-    def test_rand4x_order_quarter_block_size_2(self) -> None:
-        self._run_random_4x_order(normal=False, block_size=8)
+    def test_rand4x_order_quarter_block_size_2(self, device) -> None:
+        self._run_random_4x_order(normal=False, block_size=8, device=device)
 
-    @requires_gpu()
-    def test_randn4x_order_quarter_block_size_2(self) -> None:
-        self._run_random_4x_order(normal=True, block_size=8)
+    def test_randn4x_order_quarter_block_size_2(self, device) -> None:
+        self._run_random_4x_order(normal=True, block_size=8, device=device)
 
-    @requires_gpu()
-    def test_rand4x_fallback_block_size_2(self) -> None:
-        self._run_random_4x_order(normal=False, block_size=2)
+    def test_rand4x_fallback_block_size_2(self, device) -> None:
+        self._run_random_4x_order(normal=False, block_size=2, device=device)
 
-    @requires_gpu()
-    def test_randn4x_fallback_block_size_2(self) -> None:
-        self._run_random_4x_order(normal=True, block_size=2)
+    def test_randn4x_fallback_block_size_2(self, device) -> None:
+        self._run_random_4x_order(normal=True, block_size=2, device=device)
 
-    def _run_random_4x_block_size_stability(self, normal: bool) -> None:
-        device = torch.device(GPU_TYPE)
+    def _run_random_4x_block_size_stability(self, normal: bool, device: str) -> None:
+        device = torch.device(device)
         sample_count = 1024
         small_block_result = torch.empty(
             sample_count, dtype=torch.float32, device=device
@@ -277,17 +266,14 @@ class Random4xTest(TestCase):
 
         torch.testing.assert_close(small_block_result, large_block_result)
 
-    @requires_gpu()
-    def test_rand4x_block_size_stability(self) -> None:
-        self._run_random_4x_block_size_stability(normal=False)
+    def test_rand4x_block_size_stability(self, device) -> None:
+        self._run_random_4x_block_size_stability(normal=False, device=device)
 
-    @requires_gpu()
-    def test_randn4x_block_size_stability(self) -> None:
-        self._run_random_4x_block_size_stability(normal=True)
+    def test_randn4x_block_size_stability(self, device) -> None:
+        self._run_random_4x_block_size_stability(normal=True, device=device)
 
-    @requires_gpu()
-    def test_rand4x_distribution(self) -> None:
-        device = torch.device(GPU_TYPE)
+    def test_rand4x_distribution(self, device) -> None:
+        device = torch.device(device)
         block_size = 1024
         num_blocks = 128
         sample_count = block_size * num_blocks
@@ -309,9 +295,8 @@ class Random4xTest(TestCase):
         max_bucket_error = (bins - sample_count / 10).abs().max().item()
         self.assertLess(max_bucket_error / (sample_count / 10), 0.08)
 
-    @requires_gpu()
-    def test_randn4x_distribution(self) -> None:
-        device = torch.device(GPU_TYPE)
+    def test_randn4x_distribution(self, device) -> None:
+        device = torch.device(device)
         block_size = 1024
         num_blocks = 128
         sample_count = block_size * num_blocks
@@ -334,6 +319,18 @@ class Random4xTest(TestCase):
         self.assertLess(abs(skewness), 0.05)
 
 
+for test_class in (
+    ExclusiveScanDecoupledLookback64Test,
+    SelectOneTest,
+    Random4xTest,
+):
+    instantiate_device_type_tests(
+        test_class,
+        globals(),
+        only_for=("cuda", "xpu"),
+        allow_xpu=True,
+    )
+
+
 if __name__ == "__main__":
-    if HAS_GPU:
-        run_tests()
+    run_tests()
