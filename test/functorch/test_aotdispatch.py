@@ -52,6 +52,7 @@ from functorch.compile import (
 )
 from functorch.experimental import control_flow
 from torch._decomp import decomposition_table
+from torch._dynamo.device_interface import get_interface_for_device
 from torch._dynamo.testing import normalize_gm
 from torch._dynamo.utils import counters
 from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
@@ -120,15 +121,15 @@ from torch.utils._python_dispatch import (
 )
 
 
-_PRIVATEUSE1_DEVICE_TYPE = torch._C._get_privateuse1_backend_name()
-requires_cuda_or_privateuse1 = (
-    requires_gpu()
-    if GPU_TYPE == _PRIVATEUSE1_DEVICE_TYPE
-    else unittest.skipIf(not torch.cuda.is_available(), "CUDA is unavailable")
+_GPU_INTERFACE = get_interface_for_device(GPU_TYPE)
+_GPU_EXPOSES_STREAMS = _GPU_INTERFACE.exposes_streams()
+requires_accelerator_streams = unittest.skipUnless(
+    HAS_GPU_AND_TRITON and _GPU_EXPOSES_STREAMS,
+    "requires accelerator stream support",
 )
-requires_sm80_or_privateuse1 = unittest.skipIf(
-    GPU_TYPE != _PRIVATEUSE1_DEVICE_TYPE and not SM80OrLater,
-    "bfloat16, float8",
+requires_accelerator_fp8 = unittest.skipUnless(
+    HAS_GPU_AND_TRITON and (GPU_TYPE != "cuda" or SM80OrLater),
+    "requires accelerator bfloat16 and float8 support",
 )
 
 
@@ -10101,7 +10102,7 @@ def forward(self, primals_1, tangents_1):
         sg_ops = [n for n in sg_mod.graph.nodes if n.op == "call_function"]
         self.assertEqual(len(sg_ops), 1)
 
-    @requires_cuda_or_privateuse1
+    @requires_accelerator_streams
     def test_control_deps_mixed_fwd_bw_deps_e2e(self):
         """Forward compilation and backward must not crash when
         wait_stream's control_deps collects forward deps."""
@@ -11601,8 +11602,7 @@ Expected a .* tangent but got a plain Tensor.""",
             x_grad = pytree.tree_map_only(torch.Tensor, lambda t: t.grad, x)
             self.assertEqual(ref_x_grad, x_grad, atol=1e-2, rtol=1e-2)
 
-    @requires_cuda_or_privateuse1
-    @requires_sm80_or_privateuse1
+    @requires_accelerator_fp8
     @parametrize("saved_tensors_hooks_filtering_mode", ["donated", "no_static", "all"])
     def test_saved_tensors_hooks_base(self, saved_tensors_hooks_filtering_mode):
         with patch(
@@ -11752,8 +11752,7 @@ Expected a .* tangent but got a plain Tensor.""",
                 #     test_fn, inp_fn, [(pack_wrapper_two_tensor, unpack_wrapper_two_tensor)]
                 # )
 
-    @requires_cuda_or_privateuse1
-    @requires_sm80_or_privateuse1
+    @requires_accelerator_fp8
     def test_saved_tensors_hooks_params(self):
         with torch.library._scoped_library("_test_aotdispatch_lib", "FRAGMENT") as lib:
             logged_shapes = []
