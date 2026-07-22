@@ -1203,6 +1203,7 @@ class CommonTemplate:
         self.assertTrue("Min" not in code[0])
 
     @xfail_if_use_tensor_descriptor
+    @requires_gpu()  # FIXME this test failed on Triton-CPU
     def test_3d_permute_tiling(self):
         """
         Test 3D tiling with permute.
@@ -1581,12 +1582,6 @@ test_torchinductor.copy_tests(
     CommonTemplate,
     TritonBlockPointerTestCPU,
     "cpu",
-    # FIXME: This test fails on Triton-CPU but should run on accelerators.
-    test_failures={
-        "test_3d_permute_tiling": test_torchinductor.TestFailure(
-            ("cpu",), is_skip=True
-        ),
-    },
     xfail_prop="_expected_failure_triton_cpu",
 )
 
@@ -2174,7 +2169,7 @@ class TestTilingExtra(InductorTestCase):
 
                 return (hidden_states_45,)
 
-        def create_parameters(device, dtype=torch.float16):
+        def create_parameters(device="cuda", dtype=torch.float16):
             """Create all the parameters needed by the GraphModule."""
             params = {}
 
