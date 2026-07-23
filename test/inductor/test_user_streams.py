@@ -35,6 +35,7 @@ from torch._inductor.utils import IndentedBuffer
 from torch._inductor.virtualized import V
 from torch.testing import FileCheck
 from torch.testing._internal.common_cuda import SM90OrLater, TEST_CUDA
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     TEST_WITH_ROCM,
@@ -2732,24 +2733,28 @@ instantiate_parametrized_tests(TestAOTIUserStreams)
 instantiate_parametrized_tests(TestStreamCudagraphInteraction)
 
 
-@unittest.skipIf(not TEST_CUDA, "requires CUDA")
 class TestStreamExternalObjectRestore(InductorTestCase):
-    def test_restore_external_objects_before_backward(self):
+    def test_restore_external_objects_before_backward(self, device):
         """Forward snapshots external object registry, backward restores it."""
         from torch._dynamo.graph_bytecode_inputs import store_user_object_weakrefs
 
         def fn(x):
-            s = torch.Stream(device="cuda")
+            s = torch.Stream(device=device)
             with s:
                 return x * 2 + 1
 
         compiled_fn = torch.compile(fn)
-        x = torch.randn(4, 4, device="cuda", requires_grad=True)
+        x = torch.randn(4, 4, device=device, requires_grad=True)
         out = compiled_fn(x)
-        store_user_object_weakrefs(torch.cuda.Stream())
+        store_user_object_weakrefs(torch.get_device_module(device).Stream())
         out.sum().backward()
         self.assertIsNotNone(x.grad)
         torch.testing.assert_close(x.grad, torch.full_like(x, 2.0))
+
+
+instantiate_device_type_tests(
+    TestStreamExternalObjectRestore, globals(), only_for=("cuda",)
+)
 
 
 if __name__ == "__main__":
