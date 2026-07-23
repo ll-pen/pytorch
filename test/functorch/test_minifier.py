@@ -147,7 +147,7 @@ class TestMinifier(TestCase):
             dump_state(gm, [fake_tensor])
 
         repro = buf.getvalue()
-        self.assertIn(f"'{device}'", repro)
+        self.assertIn(f"'{torch.device(device)}'", repro)
 
 
 instantiate_parametrized_tests(TestMinifier)
