@@ -124,12 +124,14 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
 
         # Scratch memory layout per block: [flag, partial_aggregate, inclusive_prefix]
         # Block 0: flag=2 (inclusive prefix ready), inclusive_prefix=10.0
-        scratch = torch.zeros(6, dtype=torch.uint64, device=device)
-        scratch[0] = 2
-        inclusive_prefix_value = torch.tensor(
-            [10.0], dtype=torch.float64, device=device
+        inclusive_prefix_bits = (
+            torch.tensor([10.0], dtype=torch.float64).view(torch.int64).item()
         )
-        scratch[2] = inclusive_prefix_value.view(torch.int64).item()
+        scratch = torch.tensor(
+            [2, 0, inclusive_prefix_bits, 0, 0, 0],
+            dtype=torch.uint64,
+            device=device,
+        )
 
         block_value = torch.tensor([5.0], dtype=torch.float64, device=device)
         index = torch.tensor([1], dtype=torch.int64, device=device)
@@ -147,12 +149,14 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
 
         # Scratch memory layout per block: [flag, partial_aggregate, inclusive_prefix]
         # Block 0: flag=2 (inclusive prefix ready), inclusive_prefix=10.0
-        scratch = torch.zeros(6, dtype=torch.uint64, device=device)
-        scratch[0] = 2
-        inclusive_prefix_value = torch.tensor(
-            [10.0], dtype=torch.float64, device=device
+        inclusive_prefix_bits = (
+            torch.tensor([10.0], dtype=torch.float64).view(torch.int64).item()
         )
-        scratch[2] = inclusive_prefix_value.view(torch.int64).item()
+        scratch = torch.tensor(
+            [2, 0, inclusive_prefix_bits, 0, 0, 0],
+            dtype=torch.uint64,
+            device=device,
+        )
 
         block_value = torch.tensor([5.0], dtype=torch.float64, device=device)
         index = torch.tensor([1], dtype=torch.int32, device=device)
@@ -319,6 +323,11 @@ class Random4xTest(TestCase):
         self.assertLess(abs(skewness), 0.05)
 
 
+device_types = ("cuda", "xpu")
+privateuse1_backend = torch._C._get_privateuse1_backend_name()
+if privateuse1_backend != "privateuse1":
+    device_types += (privateuse1_backend,)
+
 for test_class in (
     ExclusiveScanDecoupledLookback64Test,
     SelectOneTest,
@@ -327,7 +336,7 @@ for test_class in (
     instantiate_device_type_tests(
         test_class,
         globals(),
-        only_for=("cuda", "xpu"),
+        only_for=device_types,
         allow_xpu=True,
     )
 
